@@ -10,7 +10,11 @@ What you get back:
 - Average team stats (yards, shooting, rebounds, and the rest)
 - Average line for every player in the live rotation
 
-Lineups are meant to be pulled from ESPN before the sims. Players marked out are left off the sheet. The numbers are a statistical toy. They are not a sportsbook line and they are not betting advice.
+Lineups are pulled from ESPN before the sims. Players marked out are left off the sheet.
+
+When that matchup has a posted number, the score, win rate, and total are blended toward it (about half early, less as the season sample grows). Player lines stay on the sim. Team ratings and usage shares lean on this year's stats, and a thin starter inherits a starter's share of the work. Drives react to the score: a two-score lead in the second half shortens the game script, and a team playing from behind passes more. Yardage and pace use a skewed draw. Outdoor NFL games also read the wind, and 15 mph or more cuts the pass rate, deep yards, and long field goals.
+
+The numbers are a statistical toy. They are not a sportsbook line and they are not betting advice.
 
 ## Run
 
@@ -40,4 +44,4 @@ NBA team shooting and rebounding are the sum of the player means. NFL team means
 | `src/lib/sim/nba-sim.ts` | Possession model and the 10,000-sim NBA average |
 | `src/lib/sim/run.ts` | `simulateMatch` entry point |
 | `src/data` | Fallback ratings if a live roster is not passed |
-| `src/lib/live` | ESPN roster, depth chart, and injury pull |
+| `src/lib/live` | ESPN roster, depth chart, injury pull, market line, and wind |

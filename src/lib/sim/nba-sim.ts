@@ -1,5 +1,5 @@
 import type { NbaTeam } from "@/data/nba";
-import { binomial, clamp, clampInt, normal, splitInt, type Rng } from "@/lib/sim/random";
+import { binomial, blendScore, clamp, clampInt, skewed, splitInt, type Rng } from "@/lib/sim/random";
 import type { NbaGame, NbaPlayerLine, NbaProj, NbaProjPlayer, NbaSide, QuarterNote } from "@/lib/sim/types";
 
 type Shot = {
@@ -120,7 +120,7 @@ function addSplit(acc: Acc[], key: keyof Acc, values: number[]) {
 }
 
 function possForGame(away: NbaTeam, home: NbaTeam, rng: Rng) {
-  return clampInt(normal(rng, (away.pace + home.pace) / 2, 2.3), 92, 112);
+  return clampInt(skewed(rng, (away.pace + home.pace) / 2, 3.1), 90, 116);
 }
 
 function sideFrom(team: NbaTeam, acc: Acc[], quarters: number[]): NbaSide {
@@ -212,7 +212,17 @@ export function simulateNbaGame(away: NbaTeam, home: NbaTeam, rng: Rng, detail: 
     }
   };
 
-  chunks.forEach((p, i) => playBlock(`Q${i + 1}`, p));
+  let runningA = 0;
+  let runningH = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    let possN = chunks[i];
+    if (i >= 2 && Math.abs(runningH - runningA) >= 18) possN = Math.max(16, Math.round(possN * (i === 3 ? 0.86 : 0.93)));
+    const beforeA = qA.reduce((s, n) => s + n, 0);
+    const beforeH = qH.reduce((s, n) => s + n, 0);
+    playBlock(`Q${i + 1}`, possN);
+    runningA += qA.reduce((s, n) => s + n, 0) - beforeA;
+    runningH += qH.reduce((s, n) => s + n, 0) - beforeH;
+  }
   let otRounds = 0;
   while (qA.reduce((s, n) => s + n, 0) === qH.reduce((s, n) => s + n, 0) && otRounds < 3) {
     otRounds += 1;
@@ -361,6 +371,17 @@ export function projectNba(away: NbaTeam, home: NbaTeam, rng: Rng, n: number): N
   const homeMap = new Map<string, NbaProjPlayer>();
   for (let i = 0; i < n; i++) {
     const g = simulateNbaGame(away, home, rng, false);
+    const blended = blendScore(g.away.score, g.home.score, home.line ?? away.line);
+    if (g.away.score > 0) {
+      const f = blended.away / g.away.score;
+      for (const p of g.away.players) p.pts *= f;
+    }
+    if (g.home.score > 0) {
+      const f = blended.home / g.home.score;
+      for (const p of g.home.players) p.pts *= f;
+    }
+    g.away.score = blended.away;
+    g.home.score = blended.home;
     sumHome += g.home.score;
     sumAway += g.away.score;
     if (g.home.score > g.away.score) homeWin += 1;

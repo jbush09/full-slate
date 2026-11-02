@@ -1,5 +1,5 @@
 import type { NflTeam } from "@/data/nfl";
-import { allocate, binomial, clamp, clampInt, fitToTarget, normal, scaleToSum, weightedIndex, type Rng } from "@/lib/sim/random";
+import { allocate, binomial, blendScore, clamp, clampInt, fitToTarget, normal, scaleToSum, skewed, weightedIndex, type Rng } from "@/lib/sim/random";
 import type { Drive, NflGame, NflPlayerLine, NflProj, NflProjPlayer, NflSide, NflTeamAvg } from "@/lib/sim/types";
 
 type Built = {
@@ -34,11 +34,20 @@ function edgeOf(off: NflTeam, def: NflTeam, home: boolean) {
   return (o / d) * (home ? 1.045 : 0.985);
 }
 
-function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng): Built {
+type Script = { lead: number; quarter: number; wind: number };
+
+function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng, script: Script = { lead: 0, quarter: 2, wind: off.windMph ?? 0 }): Built {
   const edge = edgeOf(off, def, home);
   let tdP = clamp(0.2 * edge * off.rz, 0.07, 0.4);
   let toP = clamp(0.1 * (off.toGive / def.toTake), 0.035, 0.2);
   let fgaP = clamp(0.16 * (0.85 + 0.15 * edge) * (0.92 + 0.08 * off.st), 0.06, 0.28);
+  if (script.quarter >= 3 && script.lead >= 14) {
+    tdP *= script.quarter >= 4 ? 0.78 : 0.88;
+    fgaP *= 0.9;
+  } else if (script.quarter >= 4 && script.lead <= -10) {
+    tdP *= 1.06;
+    fgaP *= 0.9;
+  }
   let sum = tdP + toP + fgaP;
   if (sum > 0.9) {
     const s = 0.9 / sum;
@@ -59,6 +68,11 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng): Built 
   const qb = qbOf(off);
   const kicker = kickerOf(off);
   const skill = off.players.filter((p) => p.pos !== "K");
+  let passRate = off.passRate;
+  if (script.quarter >= 3 && script.lead >= 14) passRate -= script.quarter >= 4 ? 0.16 : 0.1;
+  else if (script.quarter >= 4 && script.lead <= -10) passRate += 0.08;
+  if (script.wind >= 15) passRate -= Math.min(0.14, (script.wind - 12) * 0.008);
+  passRate = clamp(passRate, 0.34, 0.78);
 
   let yards = 0;
   let plays = 3;
@@ -72,9 +86,9 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng): Built 
   let turnover: "int" | "fumble" | null = null;
 
   if (kind === "TD") {
-    yards = clampInt(normal(rng, 62, 15), 8, 92);
+    yards = clampInt(skewed(rng, 62, 18), 8, 99);
     plays = clampInt(normal(rng, 8.2, 2), 1, 15);
-    const passBias = clamp(off.passRate + 0.08, 0.42, 0.8);
+    const passBias = clamp(passRate + 0.08, 0.38, 0.82);
     const isPass = rng() < passBias;
     if (isPass) {
       const receivers = skill.filter((p) => p.pos !== "QB" && p.tgt > 0);
@@ -106,7 +120,8 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng): Built 
     let make = kicker.fg;
     if (dist >= 50) make -= (dist - 50) * 0.035;
     else if (dist <= 35) make += 0.06;
-    make = clamp(make * (0.92 + 0.08 * off.st), 0.35, 0.97);
+    if (script.wind >= 15 && dist >= 40) make -= Math.min(0.16, (script.wind - 12) * 0.007);
+    make = clamp(make * (0.92 + 0.08 * off.st), 0.28, 0.97);
     fgAtt = true;
     fgMade = rng() < make;
     points = fgMade ? 3 : 0;
@@ -131,9 +146,12 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng): Built 
     detail = "Punt";
   }
 
-  const share = clamp(off.passRate + (qb.ypa - 7.2) * 0.04 + normal(rng, 0, 0.06), 0.35, 0.78);
+  const share = clamp(passRate + (qb.ypa - 7.2) * 0.04 + normal(rng, 0, 0.06), 0.32, 0.8);
   const passYd = Math.round(yards * share);
   const rushYd = yards - passYd;
+  if (script.quarter >= 4 && script.lead >= 14) {
+    plays = Math.max(3, Math.round(plays * 0.9));
+  }
 
   return {
     abbr: off.abbr,
@@ -295,9 +313,11 @@ function boxTeam(
     recSum += 1;
   }
 
+  const wind = off.windMph ?? 0;
+  const yprOf = (ypr: number) => (wind >= 15 && ypr > 11 ? clamp(ypr - Math.min(2.2, (wind - 12) * 0.11), 7.5, 18) : ypr);
   const recYards = fitToTarget(
     scaleToSum(
-      receivers.map((p, i) => rec[i] * p.ypr),
+      receivers.map((p, i) => rec[i] * yprOf(p.ypr)),
       passYd,
     ),
     passYd,
@@ -412,37 +432,39 @@ function quartersFrom(drives: { points: number; quarter: number }[]) {
 }
 
 export function simulateNflGame(away: NflTeam, home: NflTeam, rng: Rng, detail: boolean): NflGame {
-  const nAway = clampInt(normal(rng, 10.7, 1.0), 8, 14);
-  const nHome = clampInt(nAway + normal(rng, 0, 0.85), 8, 14);
+  const wind = home.windMph ?? away.windMph ?? 0;
+  const nAway = clampInt(skewed(rng, 10.7, 1.15), 8, 15);
+  const nHome = clampInt(nAway + normal(rng, 0, 0.85), 8, 15);
   const builtA: Built[] = [];
   const builtH: Built[] = [];
-  for (let i = 0; i < nAway; i++) builtA.push(buildDrive(away, home, false, rng));
-  for (let i = 0; i < nHome; i++) builtH.push(buildDrive(home, away, true, rng));
-
-  const seq: { side: "A" | "H"; d: Built }[] = [];
-  const n = Math.max(builtA.length, builtH.length);
+  const seq: { side: "A" | "H"; d: Built; quarter: number }[] = [];
+  const n = Math.max(nAway, nHome);
+  let aPts = 0;
+  let hPts = 0;
   for (let i = 0; i < n; i++) {
-    if (i < builtA.length) seq.push({ side: "A", d: builtA[i] });
-    if (i < builtH.length) seq.push({ side: "H", d: builtH[i] });
+    const quarter = Math.min(4, Math.floor((i / n) * 4) + 1);
+    if (i < nAway) {
+      const d = buildDrive(away, home, false, rng, { lead: aPts - hPts, quarter, wind });
+      builtA.push(d);
+      seq.push({ side: "A", d, quarter });
+      aPts += d.points;
+    }
+    if (i < nHome) {
+      const d = buildDrive(home, away, true, rng, { lead: hPts - aPts, quarter, wind });
+      builtH.push(d);
+      seq.push({ side: "H", d, quarter });
+      hPts += d.points;
+    }
   }
-  const totalPlays = seq.reduce((s, x) => s + x.d.plays, 0) || 1;
-  let cum = 0;
-  const stamped = seq.map((x) => {
-    const mid = cum + x.d.plays / 2;
-    const quarter = Math.min(4, Math.floor((mid / totalPlays) * 4) + 1);
-    cum += x.d.plays;
-    return { ...x, quarter };
-  });
-
-  const score = (side: "A" | "H") =>
-    stamped.filter((x) => x.side === side).reduce((s, x) => s + x.d.points, 0);
+  const stamped = seq;
+  const score = (side: "A" | "H") => stamped.filter((x) => x.side === side).reduce((s, x) => s + x.d.points, 0);
   let ot = false;
   let round = 0;
   while (score("A") === score("H") && round < 3) {
     ot = true;
     round += 1;
-    const a = buildDrive(away, home, false, rng);
-    const h = buildDrive(home, away, true, rng);
+    const a = buildDrive(away, home, false, rng, { lead: 0, quarter: 5, wind });
+    const h = buildDrive(home, away, true, rng, { lead: 0, quarter: 5, wind });
     builtA.push(a);
     builtH.push(h);
     stamped.push({ side: "A", d: a, quarter: 5 });
@@ -669,6 +691,9 @@ export function projectNfl(away: NflTeam, home: NflTeam, rng: Rng, n: number): N
   const homeAcc = emptyAcc();
   for (let i = 0; i < n; i++) {
     const g = simulateNflGame(away, home, rng, false);
+    const blended = blendScore(g.away.score, g.home.score, home.line ?? away.line);
+    g.away.score = blended.away;
+    g.home.score = blended.home;
     sumHome += g.home.score;
     sumAway += g.away.score;
     if (g.home.score > g.away.score) homeWin += 1;

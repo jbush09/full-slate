@@ -1,4 +1,4 @@
-import type { NbaPos } from "@/lib/sim/types";
+import type { MarketLine, NbaPos } from "@/lib/sim/types";
 
 export type NbaPlayer = {
   name: string;
@@ -35,6 +35,8 @@ export type NbaTeam = {
   orb: number;
   tov: number;
   players: NbaPlayer[];
+  gamesPlayed?: number;
+  line?: MarketLine | null;
 };
 
 type Role = "sg" | "sw" | "sb" | "sec" | "st" | "role" | "big" | "bn";

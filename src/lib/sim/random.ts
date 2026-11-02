@@ -23,6 +23,27 @@ export function clampInt(n: number, lo: number, hi: number) {
   return Math.round(clamp(n, lo, hi));
 }
 
+export function skewed(rng: Rng, mean: number, sd: number) {
+  const z = normal(rng, 0, 1);
+  const tilt = z >= 0 ? z * 1.35 : z * 0.72;
+  return mean + sd * tilt;
+}
+
+export function blendScore(
+  away: number,
+  home: number,
+  line: { homeMargin: number; total: number; weight: number } | null | undefined,
+) {
+  if (!line || !Number.isFinite(line.total) || !Number.isFinite(line.homeMargin)) return { away, home };
+  const w = clamp(line.weight, 0, 0.65);
+  const margin = (home - away) * (1 - w) + line.homeMargin * w;
+  const total = Math.max(0, (home + away) * (1 - w) + line.total * w);
+  return {
+    away: Math.max(0, (total - margin) / 2),
+    home: Math.max(0, (total + margin) / 2),
+  };
+}
+
 export function normal(rng: Rng, mean: number, sd: number) {
   const u = Math.max(rng(), 1e-9);
   const v = rng();

@@ -3,6 +3,7 @@ import { NFL_BY_ID, type NflPlayer, type NflTeam } from "@/data/nfl";
 import { clamp } from "@/lib/sim/random";
 import type { League, NbaPos, NflPos } from "@/lib/sim/types";
 import type { LiveLineup, LiveRosterPlayer, LiveSlate, LiveSpot, SlateChip } from "@/lib/live/types";
+import { NFL_VENUE } from "@/lib/live/venues";
 
 type Ath = {
   id: string;
@@ -35,7 +36,7 @@ const statCache = new Map<string, { at: number; row: Record<string, Record<strin
 const slateCache = new Map<string, { at: number; value: LiveSlate }>();
 let nflIds: Map<string, string> | null = null;
 let nbaIds: Map<string, string> | null = null;
-let nbaForm: { at: number; map: Map<string, { for: number; against: number }> } | null = null;
+let nbaForm: { at: number; map: Map<string, { for: number; against: number; games: number }> } | null = null;
 
 const NFL_BASE: Record<NflPos, { rush: number; tgt: number; ypc: number; ypr: number; comp: number; ypa: number; int: number; fg: number }> = {
   QB: { rush: 10, tgt: 0, ypc: 4.8, ypr: 8, comp: 0.645, ypa: 7.15, int: 0.021, fg: 0.84 },
@@ -79,6 +80,38 @@ function num(raw: unknown): number | null {
   if (typeof raw !== "string" || raw === "" || raw === "--") return null;
   const v = Number(raw.replace(/,/g, "").replace("%", ""));
   return Number.isFinite(v) ? v : null;
+}
+
+const windCache = new Map<string, { at: number; mph: number | null }>();
+
+async function windAt(lat: number, lon: number, whenIso: string): Promise<number | null> {
+  const key = `${lat.toFixed(2)},${lon.toFixed(2)},${whenIso.slice(0, 13)}`;
+  const hit = windCache.get(key);
+  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.mph;
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(3)}&longitude=${lon.toFixed(3)}&hourly=wind_speed_10m&wind_speed_unit=mph&forecast_days=7&timezone=UTC`;
+    const data = await fetch(url).then((res) => res.json());
+    const times = (data?.hourly?.time ?? []) as string[];
+    const speeds = (data?.hourly?.wind_speed_10m ?? []) as number[];
+    const when = Date.parse(whenIso);
+    let best = -1;
+    let bestDt = Infinity;
+    for (let i = 0; i < times.length; i++) {
+      const stamp = Date.parse(times[i].endsWith("Z") ? times[i] : `${times[i]}Z`);
+      const dt = Math.abs(stamp - when);
+      if (dt < bestDt) {
+        bestDt = dt;
+        best = i;
+      }
+    }
+    const mph = best >= 0 && bestDt < 6 * 3600_000 ? speeds[best] : null;
+    const value = mph != null && Number.isFinite(mph) ? mph : null;
+    windCache.set(key, { at: Date.now(), mph: value });
+    return value;
+  } catch {
+    windCache.set(key, { at: Date.now(), mph: null });
+    return null;
+  }
 }
 
 function asPct(value: number | null | undefined) {
@@ -172,6 +205,9 @@ type EventHit = {
   state: string;
   awayAbbr: string;
   homeAbbr: string;
+  spread: number | null;
+  total: number | null;
+  book: string | null;
 };
 
 function readEvents(league: League, events: any[]): EventHit[] {
@@ -185,6 +221,9 @@ function readEvents(league: League, events: any[]): EventHit[] {
     const awayId = ourId(league, away.team.abbreviation);
     const homeId = ourId(league, home.team.abbreviation);
     if (!awayId || !homeId) continue;
+    const odds = comp?.odds?.[0];
+    const spread = typeof odds?.spread === "number" ? odds.spread : num(odds?.spread);
+    const total = typeof odds?.overUnder === "number" ? odds.overUnder : num(odds?.overUnder);
     out.push({
       id: String(event.id),
       awayId,
@@ -195,6 +234,9 @@ function readEvents(league: League, events: any[]): EventHit[] {
       state: String(event.status?.type?.state ?? ""),
       awayAbbr: awayId,
       homeAbbr: homeId,
+      spread,
+      total,
+      book: String(odds?.provider?.displayName ?? odds?.provider?.name ?? "the market"),
     });
   }
   return out;
@@ -407,7 +449,6 @@ function nflPlayer(chosen: Chosen, stats: Record<string, Record<string, number>>
   const carries = rush.rushingAttempts ?? 0;
   const targets = rec.receivingTargets ?? rec.receptions ?? 0;
   const has = attempts >= 8 || carries >= 4 || targets >= 4 || (kick.fieldGoalAttempts ?? 0) >= 1;
-  const scale = rich || has ? 1 : 0.45;
   let comp = asPct(pass.completionPct);
   if ((comp == null || attempts < 15) && attempts >= 15 && pass.completions != null) comp = pass.completions / attempts;
   let intRate = attempts >= 20 && pass.interceptions != null ? pass.interceptions / attempts : null;
@@ -415,11 +456,16 @@ function nflPlayer(chosen: Chosen, stats: Record<string, Record<string, number>>
   const ypc = rush.yardsPerRushAttempt;
   const ypr = rec.yardsPerReception;
   const ypa = pass.yardsPerPassAttempt;
+  const starter = chosen.role === "starter";
+  const thin = !has;
+  const prior = !rich ? (starter ? 1 : 0.6) : starter && thin ? 1.55 : starter ? 1 : 0.55;
+  const rushTd = rush.rushingTouchdowns ?? 0;
+  const recTd = rec.receivingTouchdowns ?? 0;
   return {
     name: chosen.athlete.displayName,
     pos: chosen.pos as NflPos,
-    rush: carries > 0 ? carries : base.rush * (chosen.slot === 0 ? scale : scale * 0.55),
-    tgt: chosen.pos === "QB" ? 0 : targets > 0 ? targets : base.tgt * (chosen.slot === 0 ? scale : scale * 0.6),
+    rush: carries >= 8 ? carries * (1 + rushTd * 0.1) : base.rush * prior,
+    tgt: chosen.pos === "QB" ? 0 : targets >= 6 ? targets * (1 + recTd * 0.08) : base.tgt * prior,
     ypc: clamp(ypc && carries >= 8 ? ypc : base.ypc, 3.1, 6.8),
     ypr: clamp(ypr && targets >= 6 ? ypr : base.ypr, 6, 18),
     comp: clamp(comp != null && attempts >= 15 ? comp : base.comp, 0.54, 0.75),
@@ -630,6 +676,8 @@ async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Pro
     const points = catStat(own, "scoring", "totalPoints");
     const ppg = catStat(own, "scoring", "totalPointsPerGame");
     const games = catStat(own, "general", "gamesPlayed") ?? (ppg && points ? Math.max(1, Math.round(points / ppg)) : null);
+    const liveW = clamp(0.22 + ((games ?? 8) / 17) * 0.58, 0.22, 0.82);
+    const rateW = clamp(0.5 + ((games ?? 8) / 17) * 0.35, 0.5, 0.85);
     const give =
       games && games > 0
         ? ((catStat(own, "passing", "interceptions") ?? 0) + (catStat(own, "miscellaneous", "fumblesLost") ?? 0)) / games
@@ -641,14 +689,15 @@ async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Pro
     const rate = passYds != null && rushYds != null && passYds + rushYds > 0 ? passYds / (passYds + rushYds) : null;
     return {
       ...base,
-      passOff: mix(base.passOff, passYpg != null ? passYpg / 210 : null, 0.35, 0.86, 1.18),
-      rushOff: mix(base.rushOff, rushYpg != null ? rushYpg / 115 : null, 0.35, 0.86, 1.18),
-      passDef: mix(base.passDef, oppPass != null ? 210 / oppPass : null, 0.35, 0.86, 1.16),
-      rushDef: mix(base.rushDef, oppRush != null ? 115 / oppRush : null, 0.35, 0.86, 1.16),
-      passRate: mix(base.passRate, rate, 0.7, 0.44, 0.68),
-      toGive: mix(base.toGive, give != null ? give / 1.15 : null, 0.55, 0.78, 1.25),
-      toTake: mix(base.toTake, take != null ? take / 0.85 : null, 0.5, 0.78, 1.25),
-      rz: mix(base.rz, rz, 0.55, 0.86, 1.2),
+      passOff: mix(base.passOff, passYpg != null ? passYpg / 210 : null, liveW, 0.86, 1.18),
+      rushOff: mix(base.rushOff, rushYpg != null ? rushYpg / 115 : null, liveW, 0.86, 1.18),
+      passDef: mix(base.passDef, oppPass != null ? 210 / oppPass : null, liveW, 0.86, 1.16),
+      rushDef: mix(base.rushDef, oppRush != null ? 115 / oppRush : null, liveW, 0.86, 1.16),
+      passRate: mix(base.passRate, rate, rateW, 0.44, 0.68),
+      toGive: mix(base.toGive, give != null ? give / 1.15 : null, liveW, 0.78, 1.25),
+      toTake: mix(base.toTake, take != null ? take / 0.85 : null, liveW, 0.78, 1.25),
+      rz: mix(base.rz, rz, liveW, 0.86, 1.2),
+      gamesPlayed: games ?? undefined,
       players,
     };
   } catch {
@@ -656,8 +705,10 @@ async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Pro
   }
 }
 
-async function tuneNba(base: NbaTeam, espnId: string, players: NbaPlayer[], form: Map<string, { for: number; against: number }>) {
+async function tuneNba(base: NbaTeam, espnId: string, players: NbaPlayer[], form: Map<string, { for: number; against: number; games: number }>) {
   const record = form.get(base.id);
+  const games = record?.games ?? 0;
+  const liveW = clamp(0.25 + (games / 82) * 0.55, 0.25, 0.8);
   let pace = base.pace;
   let orb = base.orb;
   let tov = base.tov;
@@ -679,11 +730,12 @@ async function tuneNba(base: NbaTeam, espnId: string, players: NbaPlayer[], form
   }
   return {
     ...base,
-    off: mix(base.off, record ? record.for / 114.5 : null, 0.58, 0.88, 1.16),
-    def: mix(base.def, record ? 114.5 / record.against : null, 0.58, 0.88, 1.16),
+    off: mix(base.off, record ? record.for / 114.5 : null, liveW, 0.88, 1.16),
+    def: mix(base.def, record ? 114.5 / record.against : null, liveW, 0.88, 1.16),
     pace,
     orb,
     tov,
+    gamesPlayed: games || undefined,
     players,
   };
 }
@@ -691,23 +743,25 @@ async function tuneNba(base: NbaTeam, espnId: string, players: NbaPlayer[], form
 async function nbaStandings() {
   if (nbaForm && Date.now() - nbaForm.at < 10 * 60_000) return nbaForm.map;
   const data = await espn("https://site.api.espn.com/apis/v2/sports/basketball/nba/standings");
-  const map = new Map<string, { for: number; against: number }>();
+  const map = new Map<string, { for: number; against: number; games: number }>();
   for (const child of data.children ?? []) {
     for (const entry of child?.standings?.entries ?? []) {
       const id = ourId("NBA", entry?.team?.abbreviation);
       const stats = entry?.stats ?? [];
       const pf = stats.find((s: any) => s.name === "avgPointsFor");
       const pa = stats.find((s: any) => s.name === "avgPointsAgainst");
+      const gp = stats.find((s: any) => s.name === "gamesPlayed");
       const scored = typeof pf?.value === "number" ? pf.value : num(pf?.displayValue);
       const allowed = typeof pa?.value === "number" ? pa.value : num(pa?.displayValue);
-      if (id && scored != null && allowed != null && allowed > 0) map.set(id, { for: scored, against: allowed });
+      const games = typeof gp?.value === "number" ? gp.value : num(gp?.displayValue) ?? 0;
+      if (id && scored != null && allowed != null && allowed > 0) map.set(id, { for: scored, against: allowed, games });
     }
   }
   nbaForm = { at: Date.now(), map };
   return map;
 }
 
-async function buildSide(league: League, our: string, espnId: string, report: Map<string, string>, year: number, form: Map<string, { for: number; against: number }>) {
+async function buildSide(league: League, our: string, espnId: string, report: Map<string, string>, year: number, form: Map<string, { for: number; against: number; games: number }>) {
   const sport = league === "NFL" ? "football/nfl" : "basketball/nba";
   const [chartsRaw, roster] = await Promise.all([depthCharts(sport, espnId), loadRoster(sport, espnId)]);
   const allowed = new Set(roster.filter((row) => row.group !== "practiceSquad").map((row) => row.id));
@@ -795,13 +849,43 @@ export async function pullMatchup(input: { league: League; awayId: string; homeI
       reports = new Map();
     }
   }
-  const form = league === "NBA" ? await nbaStandings() : new Map<string, { for: number; against: number }>();
+  const form = league === "NBA" ? await nbaStandings() : new Map<string, { for: number; against: number; games: number }>();
   const [awaySide, homeSide] = await Promise.all([
     buildSide(league, awayId, awayEspn, reports.get(awayEspn) ?? new Map(), slate.year, form),
     buildSide(league, homeId, homeEspn, reports.get(homeEspn) ?? new Map(), slate.year, form),
   ]);
   const flipped = Boolean(event && (event.awayId !== awayId || event.homeId !== homeId));
   const season = league === "NFL" ? `${slate.year}` : `${slate.year - 1}-${String(slate.year).slice(2)}`;
+  const games = Math.max(awaySide.team.gamesPlayed ?? 0, homeSide.team.gamesPlayed ?? 0);
+  const weight = league === "NFL" ? clamp(0.55 - (games / 17) * 0.22, 0.3, 0.55) : clamp(0.48 - (games / 82) * 0.18, 0.28, 0.48);
+  const line =
+    event && event.spread != null && event.total != null
+      ? {
+          homeMargin: event.homeId === homeId ? -event.spread : event.spread,
+          total: event.total,
+          book: event.book || "the market",
+          weight,
+        }
+      : null;
+  let wind: number | null = null;
+  if (league === "NFL" && event) {
+    const venue = NFL_VENUE[event.homeId];
+    if (venue?.dome) wind = 0;
+    else if (venue) wind = await windAt(venue.lat, venue.lon, event.when);
+  }
+  if (league === "NFL") {
+    const awayNfl = awaySide.team as NflTeam;
+    const homeNfl = homeSide.team as NflTeam;
+    awayNfl.line = line;
+    homeNfl.line = line;
+    awayNfl.windMph = wind;
+    homeNfl.windMph = wind;
+  } else {
+    const awayNba = awaySide.team as NbaTeam;
+    const homeNba = homeSide.team as NbaTeam;
+    awayNba.line = line;
+    homeNba.line = line;
+  }
   const value: LiveLineup = {
     league,
     awayId,

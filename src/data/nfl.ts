@@ -1,4 +1,4 @@
-import type { NflPos } from "@/lib/sim/types";
+import type { MarketLine, NflPos } from "@/lib/sim/types";
 
 export type NflPlayer = {
   name: string;
@@ -35,6 +35,9 @@ export type NflTeam = {
   rz: number;
   st: number;
   players: NflPlayer[];
+  gamesPlayed?: number;
+  windMph?: number | null;
+  line?: MarketLine | null;
 };
 
 const z = { rush: 0, tgt: 0, ypc: 4.3, ypr: 11, comp: 0.65, ypa: 7.2, int: 0.021, fg: 0.85 };

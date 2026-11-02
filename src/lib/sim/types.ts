@@ -1,5 +1,12 @@
 export type League = "NFL" | "NBA";
 
+export type MarketLine = {
+  homeMargin: number;
+  total: number;
+  book: string;
+  weight: number;
+};
+
 export type DriveResult = "TD" | "FG" | "PUNT" | "TO" | "DOWNS" | "MISS";
 
 export type Drive = {
