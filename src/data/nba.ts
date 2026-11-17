@@ -37,6 +37,19 @@ export type NbaTeam = {
   players: NbaPlayer[];
   gamesPlayed?: number;
   line?: MarketLine | null;
+  style?: NbaStyle;
+  spot?: NbaSpot;
+};
+
+export type NbaStyle = {
+  three: number;
+  oppThree: number;
+};
+
+export type NbaSpot = {
+  three: number;
+  tov: number;
+  form: number;
 };
 
 type Role = "sg" | "sw" | "sb" | "sec" | "st" | "role" | "big" | "bn";

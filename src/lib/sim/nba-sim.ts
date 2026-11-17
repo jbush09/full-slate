@@ -23,47 +23,69 @@ function factor(off: NbaTeam, def: NbaTeam, home: boolean) {
   return clamp(softened * (home ? 1.016 : 0.992), 0.94, 1.035);
 }
 
+function pickIndex(weights: number[], total: number, rng: Rng) {
+  let mark = rng() * total;
+  for (let i = 0; i < weights.length; i++) {
+    mark -= weights[i];
+    if (mark <= 0) return i;
+  }
+  return weights.length - 1;
+}
+
 function shoot(team: NbaTeam, opp: NbaTeam, poss: number, home: boolean, rng: Rng): Shot {
-  const fac = clamp(factor(team, opp, home) * (0.94 + rng() * 0.12), 0.82, 1.26);
   const n = team.players.length;
-  const weights = team.players.map((p) => Math.max(0.4, p.usg * p.min * (0.86 + rng() * 0.28)));
-  const tovRate = clamp(team.tov * (0.88 + rng() * 0.24) * (0.92 + opp.def * 0.08), 0.09, 0.18);
-  const teamTov = binomial(rng, Math.max(0, poss), tovRate);
-  const fgaTeam = clampInt((poss - teamTov) * (0.98 + team.orb * 0.28) * (0.97 + rng() * 0.06), 4, poss + 14);
-  const fga = splitInt(fgaTeam, weights);
-  const tov = splitInt(
-    teamTov,
-    team.players.map((p) => p.tov * p.min),
-  );
-  const fgm: number[] = [];
-  const tpa: number[] = [];
-  const tpm: number[] = [];
-  const fta: number[] = [];
-  const ftm: number[] = [];
-  const pts: number[] = [];
+  const weights = team.players.map((p) => Math.max(0.4, p.usg * p.min));
+  const totalW = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const fac = clamp(factor(team, opp, home) * (team.spot?.form ?? 1) * (0.94 + rng() * 0.12), 0.8, 1.28);
+  const tovRate = clamp(team.tov * (team.spot?.tov ?? 1) * (0.92 + rng() * 0.16), 0.09, 0.19);
+  const orb = clamp(team.orb * (0.9 + rng() * 0.2), 0.16, 0.38);
+  const fga = Array<number>(n).fill(0);
+  const fgm: number[] = Array<number>(n).fill(0);
+  const tpa: number[] = Array<number>(n).fill(0);
+  const tpm: number[] = Array<number>(n).fill(0);
+  const fta: number[] = Array<number>(n).fill(0);
+  const ftm: number[] = Array<number>(n).fill(0);
+  const tov = Array<number>(n).fill(0);
+  const pts = Array<number>(n).fill(0);
   let missed2 = 0;
   let misses = 0;
+  let teamTov = 0;
   let teamPts = 0;
-  for (let i = 0; i < n; i++) {
+  const take = (i: number) => {
     const p = team.players[i];
-    const threes = binomial(rng, fga[i], clamp(p.three, 0.02, 0.72));
-    const twos = fga[i] - threes;
-    const m3 = binomial(rng, threes, clamp(p.fg3 * fac, 0.26, 0.48));
-    const m2 = binomial(rng, twos, clamp(p.fg2 * fac, 0.4, 0.74));
-    const attFt = binomial(rng, Math.max(fga[i], 1), clamp(p.ftr, 0, 0.7));
-    const ftAtt = fga[i] === 0 ? 0 : attFt;
-    const madeFt = binomial(rng, ftAtt, clamp(p.ft, 0.5, 0.95));
-    const made = m2 + m3;
-    const points = m2 * 2 + m3 * 3 + madeFt;
-    tpa.push(threes);
-    tpm.push(m3);
-    fgm.push(made);
-    fta.push(ftAtt);
-    ftm.push(madeFt);
-    pts.push(points);
-    missed2 += twos - m2;
-    misses += fga[i] - made;
+    const is3 = rng() < clamp(p.three * (team.spot?.three ?? 1), 0.02, 0.75);
+    fga[i] += 1;
+    if (is3) tpa[i] += 1;
+    const made = rng() < (is3 ? clamp(p.fg3 * fac, 0.26, 0.48) : clamp(p.fg2 * fac, 0.4, 0.74));
+    if (!made) {
+      misses += 1;
+      if (!is3) missed2 += 1;
+      return false;
+    }
+    fgm[i] += 1;
+    if (is3) tpm[i] += 1;
+    const points = is3 ? 3 : 2;
+    pts[i] += points;
     teamPts += points;
+    return true;
+  };
+  for (let k = 0; k < poss; k++) {
+    const i = pickIndex(weights, totalW, rng);
+    if (rng() < tovRate) {
+      tov[i] += 1;
+      teamTov += 1;
+      continue;
+    }
+    const made = take(i);
+    if (!made && rng() < orb) take(pickIndex(weights, totalW, rng));
+    const shooter = team.players[i];
+    if (rng() < clamp(shooter.ftr * 0.5, 0.02, 0.4)) {
+      const madeFt = binomial(rng, 2, clamp(shooter.ft, 0.5, 0.95));
+      fta[i] += 2;
+      ftm[i] += madeFt;
+      pts[i] += madeFt;
+      teamPts += madeFt;
+    }
   }
   return { fga, fgm, tpa, tpm, fta, ftm, tov, pts, missed2, misses, teamTov, teamPts };
 }

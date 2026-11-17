@@ -1,9 +1,10 @@
 import { NBA_BY_ID, type NbaPlayer, type NbaTeam } from "@/data/nba";
-import { NFL_BY_ID, type NflPlayer, type NflTeam } from "@/data/nfl";
+import { NFL_BY_ID, type NflPlayer, type NflTeam, type NflCalls } from "@/data/nfl";
 import { clamp } from "@/lib/sim/random";
 import type { League, NbaPos, NflPos } from "@/lib/sim/types";
 import type { LiveLineup, LiveRosterPlayer, LiveSlate, LiveSpot, SlateChip } from "@/lib/live/types";
 import { NFL_VENUE } from "@/lib/live/venues";
+import { isBinary, marketOf, marketRank, PROP_LABEL, type ListedProp, type PropBoardData } from "@/lib/props";
 
 type Ath = {
   id: string;
@@ -82,17 +83,21 @@ function num(raw: unknown): number | null {
   return Number.isFinite(v) ? v : null;
 }
 
-const windCache = new Map<string, { at: number; mph: number | null }>();
+type Sky = { windMph: number | null; tempF: number | null; wet: boolean };
 
-async function windAt(lat: number, lon: number, whenIso: string): Promise<number | null> {
-  const key = `${lat.toFixed(2)},${lon.toFixed(2)},${whenIso.slice(0, 13)}`;
-  const hit = windCache.get(key);
-  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.mph;
+const skyCache = new Map<string, { at: number; sky: Sky | null }>();
+
+async function openMeteoSky(lat: number, lon: number, whenIso: string): Promise<Sky | null> {
   try {
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(3)}&longitude=${lon.toFixed(3)}&hourly=wind_speed_10m&wind_speed_unit=mph&forecast_days=7&timezone=UTC`;
-    const data = await fetch(url).then((res) => res.json());
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(3)}&longitude=${lon.toFixed(3)}&hourly=wind_speed_10m,temperature_2m,precipitation,snowfall&wind_speed_unit=mph&temperature_unit=fahrenheit&precipitation_unit=inch&forecast_days=7&timezone=UTC`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
     const times = (data?.hourly?.time ?? []) as string[];
     const speeds = (data?.hourly?.wind_speed_10m ?? []) as number[];
+    const temps = (data?.hourly?.temperature_2m ?? []) as number[];
+    const rain = (data?.hourly?.precipitation ?? []) as number[];
+    const snow = (data?.hourly?.snowfall ?? []) as number[];
     const when = Date.parse(whenIso);
     let best = -1;
     let bestDt = Infinity;
@@ -104,14 +109,63 @@ async function windAt(lat: number, lon: number, whenIso: string): Promise<number
         best = i;
       }
     }
-    const mph = best >= 0 && bestDt < 6 * 3600_000 ? speeds[best] : null;
-    const value = mph != null && Number.isFinite(mph) ? mph : null;
-    windCache.set(key, { at: Date.now(), mph: value });
-    return value;
+    if (best < 0 || bestDt >= 6 * 3600_000) return null;
+    const wind = speeds[best];
+    const temp = temps[best];
+    return {
+      windMph: Number.isFinite(wind) ? wind : null,
+      tempF: Number.isFinite(temp) ? temp : null,
+      wet: (rain[best] ?? 0) >= 0.03 || (snow[best] ?? 0) >= 0.02,
+    };
   } catch {
-    windCache.set(key, { at: Date.now(), mph: null });
     return null;
   }
+}
+
+async function nwsSky(lat: number, lon: number, whenIso: string): Promise<Sky | null> {
+  try {
+    const headers = { accept: "application/geo+json", "user-agent": "FullSlate/1.0 (sports sim)" };
+    const pointsRes = await fetch(`https://api.weather.gov/points/${lat.toFixed(3)},${lon.toFixed(3)}`, { headers });
+    if (!pointsRes.ok) return null;
+    const points = await pointsRes.json();
+    const hourlyUrl = points?.properties?.forecastHourly;
+    if (!hourlyUrl) return null;
+    const hourlyRes = await fetch(hourlyUrl, { headers });
+    if (!hourlyRes.ok) return null;
+    const periods = ((await hourlyRes.json())?.properties?.periods ?? []) as any[];
+    const when = Date.parse(whenIso);
+    let best: any = null;
+    let bestDt = Infinity;
+    for (const period of periods) {
+      const stamp = Date.parse(period.startTime);
+      const dt = Math.abs(stamp - when);
+      if (dt < bestDt) {
+        bestDt = dt;
+        best = period;
+      }
+    }
+    if (!best || bestDt > 3 * 3600_000) return null;
+    const speeds = String(best.windSpeed ?? "").match(/\d+/g)?.map(Number) ?? [];
+    const pop = best.probabilityOfPrecipitation?.value;
+    const text = `${best.shortForecast ?? ""}`.toLowerCase();
+    const wet = (typeof pop === "number" && pop >= 40) || /rain|snow|storm|drizzle|shower|sleet/.test(text);
+    return {
+      windMph: speeds.length ? Math.max(...speeds) : null,
+      tempF: typeof best.temperature === "number" ? best.temperature : null,
+      wet,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function skyAt(lat: number, lon: number, whenIso: string): Promise<Sky | null> {
+  const key = `${lat.toFixed(2)},${lon.toFixed(2)},${whenIso.slice(0, 13)}`;
+  const hit = skyCache.get(key);
+  if (hit && Date.now() - hit.at < (hit.sky ? 30 * 60_000 : 2 * 60_000)) return hit.sky;
+  const sky = (await openMeteoSky(lat, lon, whenIso)) ?? (await nwsSky(lat, lon, whenIso));
+  skyCache.set(key, { at: Date.now(), sky });
+  return sky;
 }
 
 function asPct(value: number | null | undefined) {
@@ -176,6 +230,32 @@ function whenLabel(iso: string) {
     hour: "numeric",
     minute: "2-digit",
   }).format(t);
+}
+
+function etStamp(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const g = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${g("year")}${g("month")}${g("day")}`;
+}
+
+function dayLabel(stamp: string, today: string) {
+  if (!stamp || stamp === today) return "Today";
+  const year = Number(stamp.slice(0, 4));
+  const month = Number(stamp.slice(4, 6));
+  const day = Number(stamp.slice(6, 8));
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  }).format(new Date(Date.UTC(year, month - 1, day, 17)));
 }
 
 async function teamIds(league: League) {
@@ -269,17 +349,20 @@ async function board(league: League) {
 }
 
 export async function listSlate(league: League): Promise<LiveSlate> {
-  const hit = slateCache.get(league);
+  const today = ymd(0);
+  const cacheKey = `${league}:${today}`;
+  const hit = slateCache.get(cacheKey);
   if (hit && Date.now() - hit.at < SLATE_MS) return hit.value;
   const data = await board(league);
+  const days = [...new Set(data.events.map((event) => etStamp(event.when)).filter(Boolean))].sort();
+  const day = days.includes(today) ? today : (days.find((stamp) => stamp > today) ?? today);
   const rank: Record<string, number> = { in: 0, pre: 1, post: 2 };
   const games: SlateChip[] = data.events
-    .filter((e) => e.state === "pre" || e.state === "in")
+    .filter((event) => etStamp(event.when) === day && (event.state === "pre" || event.state === "in" || event.state === "post"))
     .sort((a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || a.when.localeCompare(b.when))
-    .slice(0, 16)
-    .map((e) => ({ awayId: e.awayId, homeId: e.homeId, state: e.state }));
-  const value = { title: data.title, games };
-  slateCache.set(league, { at: Date.now(), value });
+    .map((event) => ({ awayId: event.awayId, homeId: event.homeId, state: event.state }));
+  const value = { title: dayLabel(day, today), games };
+  slateCache.set(cacheKey, { at: Date.now(), value });
   return value;
 }
 
@@ -662,6 +745,173 @@ function mix(prior: number, live: number | null, weight: number, lo: number, hi:
   return clamp(prior * (1 - weight) + live * weight, lo, hi);
 }
 
+const nflPlayCache = new Map<string, { at: number; calls: NflCalls | null; usage: Map<string, { car: number; tgt: number }>; games: number }>();
+
+function rateOf(pass: number, rush: number, fallback: number) {
+  const n = pass + rush;
+  return n >= 8 ? pass / n : fallback;
+}
+
+function clockSeconds(raw: string) {
+  if (!raw.includes(":")) return 0;
+  const [m, s] = raw.split(":");
+  return (Number(m) || 0) * 60 + (Number(s) || 0);
+}
+
+function scrimmage(label: string) {
+  if (label === "Rush" || label === "Rushing Touchdown" || label === "Kneel") return "rush";
+  if (
+    label === "Pass Reception" ||
+    label === "Pass Incompletion" ||
+    label === "Passing Touchdown" ||
+    label === "Sack" ||
+    label === "Pass Interception Return" ||
+    label === "Spike"
+  )
+    return "pass";
+  return "";
+}
+
+async function nflPlayProfile(espnId: string): Promise<{ calls: NflCalls; usage: Map<string, { car: number; tgt: number }>; games: number } | null> {
+  const hit = nflPlayCache.get(espnId);
+  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.calls ? { calls: hit.calls, usage: hit.usage, games: hit.games } : null;
+  try {
+    const schedule = await espn(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${espnId}/schedule`);
+    const ids = ((schedule.events ?? []) as any[])
+      .filter((event) => event?.competitions?.[0]?.status?.type?.state === "post")
+      .slice(-4)
+      .map((event) => String(event.id));
+    if (ids.length < 2) {
+      nflPlayCache.set(espnId, { at: Date.now(), calls: null, usage: new Map(), games: 0 });
+      return null;
+    }
+    const games = await pool(ids, 3, (id) =>
+      espn(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event=${id}`).catch(() => null),
+    );
+    let drives = 0;
+    let plays = 0;
+    let yards = 0;
+    let secs = 0;
+    let td = 0;
+    let fg = 0;
+    let to = 0;
+    let go = 0;
+    let kick = 0;
+    const buckets = {
+      neutral: [0, 0],
+      lead: [0, 0],
+      trail: [0, 0],
+      short: [0, 0],
+      long: [0, 0],
+    };
+    const usage = new Map<string, { car: number; tgt: number }>();
+    let counted = 0;
+    for (const game of games) {
+      const list = game?.drives?.previous ?? [];
+      if (!list.length) continue;
+      const homeId = String(
+        game?.header?.competitions?.[0]?.competitors?.find((side: any) => side.homeAway === "home")?.team?.id ?? "",
+      );
+      const mine = list.filter((drive: any) => String(drive?.team?.id ?? "") === espnId && Number(drive?.offensivePlays ?? 0) >= 1);
+      if (!mine.length) continue;
+      counted += 1;
+      for (const drive of mine) {
+        drives += 1;
+        secs += clockSeconds(String(drive?.timeElapsed?.displayValue ?? ""));
+        const result = String(drive?.displayResult ?? "");
+        if (result.includes("Touchdown")) td += 1;
+        else if (result.includes("Field Goal") && !result.includes("Miss")) fg += 1;
+        else if (result.includes("Interception") || result.includes("Fumble")) to += 1;
+        for (const play of drive.plays ?? []) {
+          const start = play?.start ?? {};
+          if (String(start?.team?.id ?? "") !== espnId) continue;
+          const label = String(play?.type?.text ?? "");
+          const down = Number(start.down ?? 0);
+          const dist = Number(start.distance ?? 10);
+          const kind = scrimmage(label);
+          if (down === 4 && (label === "Punt" || label.startsWith("Field Goal"))) kick += 1;
+          if (down === 4 && kind) go += 1;
+          if (!kind) continue;
+          plays += 1;
+          yards += Number(play?.statYardage ?? 0);
+          const ownLead =
+            espnId === homeId
+              ? Number(play?.homeScore ?? 0) - Number(play?.awayScore ?? 0)
+              : Number(play?.awayScore ?? 0) - Number(play?.homeScore ?? 0);
+          const slot = kind === "pass" ? 0 : 1;
+          const mark = (key: keyof typeof buckets) => {
+            buckets[key][slot] += 1;
+          };
+          if (dist <= 2) mark("short");
+          else if (down >= 3 && dist >= 7) mark("long");
+          else mark("neutral");
+          if (Number(play?.period?.number ?? 1) >= 4 && ownLead >= 8) mark("lead");
+          if (Number(play?.period?.number ?? 1) >= 4 && ownLead <= -8) mark("trail");
+        }
+      }
+      const block = ((game?.boxscore?.players ?? []) as any[]).find((item) => String(item?.team?.id) === espnId);
+      for (const cat of block?.statistics ?? []) {
+        const name = String(cat?.name ?? "");
+        if (name !== "rushing" && name !== "receiving") continue;
+        for (const athlete of cat.athletes ?? []) {
+          const id = athlete?.athlete?.id != null ? String(athlete.athlete.id) : "";
+          if (!id || athlete?.didNotPlay) continue;
+          const row = usage.get(id) ?? { car: 0, tgt: 0 };
+          const stats = (athlete.stats ?? []) as string[];
+          if (name === "rushing") row.car += num(stats[0]) ?? 0;
+          if (name === "receiving") row.tgt += num(stats[5]) ?? 0;
+          usage.set(id, row);
+        }
+      }
+    }
+    if (counted < 2 || plays < 40) {
+      nflPlayCache.set(espnId, { at: Date.now(), calls: null, usage: new Map(), games: 0 });
+      return null;
+    }
+    const neutral = rateOf(buckets.neutral[0], buckets.neutral[1], 0.57);
+    const calls: NflCalls = {
+      drives: clamp(drives / counted, 8, 15),
+      plays: clamp(plays / drives, 4, 9),
+      sec: clamp(secs / plays, 20, 40),
+      ypp: clamp(yards / plays, 3.6, 7.2),
+      pass: clamp(neutral, 0.4, 0.72),
+      passLead: clamp(rateOf(buckets.lead[0], buckets.lead[1], neutral - 0.1), 0.32, 0.7),
+      passTrail: clamp(rateOf(buckets.trail[0], buckets.trail[1], neutral + 0.1), 0.45, 0.86),
+      passShort: clamp(rateOf(buckets.short[0], buckets.short[1], neutral - 0.12), 0.25, 0.7),
+      passLong: clamp(rateOf(buckets.long[0], buckets.long[1], neutral + 0.14), 0.5, 0.9),
+      td: clamp(td / drives, 0.08, 0.4),
+      fg: clamp(fg / drives, 0.04, 0.28),
+      to: clamp(to / drives, 0.04, 0.22),
+      go4: clamp(go / Math.max(1, go + kick), 0.05, 0.6),
+    };
+    nflPlayCache.set(espnId, { at: Date.now(), calls, usage, games: counted });
+    return { calls, usage, games: counted };
+  } catch {
+    nflPlayCache.set(espnId, { at: Date.now(), calls: null, usage: new Map(), games: 0 });
+    return null;
+  }
+}
+
+function applyNflPlays(
+  players: NflPlayer[],
+  chosen: Chosen[],
+  profile: { calls: NflCalls; usage: Map<string, { car: number; tgt: number }>; games: number } | null,
+) {
+  if (!profile) return false;
+  const games = Math.max(1, profile.games);
+  for (let i = 0; i < players.length; i++) {
+    const row = profile.usage.get(String(chosen[i].athlete.id));
+    const hurt = chosen[i].tag === "Q" || chosen[i].tag === "DTD" ? 0.82 : 1;
+    if (!row) continue;
+    if (players[i].pos === "QB") players[i].rush = clamp((row.car / games) * hurt, 0.4, 14);
+    else {
+      if (row.car >= games) players[i].rush = clamp((row.car / games) * hurt, 0, 28);
+      if (row.tgt >= games) players[i].tgt = clamp((row.tgt / games) * hurt, 0, 14);
+    }
+  }
+  return true;
+}
+
 async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Promise<NflTeam> {
   try {
     const data = await espn(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${espnId}/statistics`);
@@ -687,6 +937,24 @@ async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Pro
     const rzRaw = catStat(own, "miscellaneous", "redzoneTouchdownPct");
     const rz = rzRaw == null ? null : rzRaw > 2 ? rzRaw / 56 : rzRaw / 0.56;
     const rate = passYds != null && rushYds != null && passYds + rushYds > 0 ? passYds / (passYds + rushYds) : null;
+    const g = games && games >= 4 ? games : null;
+    const sacksAllowed = g ? (catStat(own, "passing", "sacks") ?? 0) / g : null;
+    const sacksMade = g ? (catStat(own, "defensive", "sacks") ?? 0) / g : null;
+    const ypc = catStat(own, "rushing", "yardsPerRushAttempt");
+    const ypcAllowed = catStat(opp, "rushing", "yardsPerRushAttempt");
+    const shape =
+      g && rushYpg != null && passYpg != null && oppRush != null && oppPass != null && ypc != null && ypcAllowed != null && sacksAllowed != null && sacksMade != null
+        ? {
+            rushYpg,
+            passYpg,
+            ypc,
+            sacksAllowed,
+            sacksMade,
+            rushAllowed: oppRush,
+            passAllowed: oppPass,
+            ypcAllowed,
+          }
+        : undefined;
     return {
       ...base,
       passOff: mix(base.passOff, passYpg != null ? passYpg / 210 : null, liveW, 0.86, 1.18),
@@ -698,11 +966,222 @@ async function tuneNfl(base: NflTeam, espnId: string, players: NflPlayer[]): Pro
       toTake: mix(base.toTake, take != null ? take / 0.85 : null, liveW, 0.78, 1.25),
       rz: mix(base.rz, rz, liveW, 0.86, 1.2),
       gamesPlayed: games ?? undefined,
+      shape,
       players,
     };
   } catch {
     return { ...base, players };
   }
+}
+
+type PlayProfile = {
+  games: number;
+  pace: number;
+  tov: number;
+  orb: number;
+  three: number;
+  oppThree: number;
+  players: Map<string, { games: number; minutes: number; fga: number; fg2m: number; tpa: number; tpm: number; fta: number; ftm: number; tov: number }>;
+};
+
+const playCache = new Map<string, { at: number; profile: PlayProfile | null }>();
+
+function blankShotRow() {
+  return { games: 0, minutes: 0, fga: 0, fg2m: 0, tpa: 0, tpm: 0, fta: 0, ftm: 0, tov: 0 };
+}
+
+function minutesOf(raw: string) {
+  if (!raw || raw === "--") return 0;
+  if (raw.includes(":")) {
+    const [m, s] = raw.split(":");
+    return (Number(m) || 0) + (Number(s) || 0) / 60;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function lastFreeThrow(label: string) {
+  const match = label.match(/(\d+) of (\d+)/);
+  return Boolean(match && match[1] === match[2]);
+}
+
+function readPlays(plays: any[], teamId: string) {
+  let poss = 0;
+  let tov = 0;
+  let oreb = 0;
+  let oppDreb = 0;
+  let teamFga = 0;
+  let teamTpa = 0;
+  let oppTpa = 0;
+  let oppTpm = 0;
+  const shots = new Map<string, ReturnType<typeof blankShotRow>>();
+  const touch = (id: string) => {
+    const row = shots.get(id) ?? blankShotRow();
+    shots.set(id, row);
+    return row;
+  };
+  for (const play of plays ?? []) {
+    const label = String(play?.type?.text ?? "");
+    const id = play?.team?.id != null ? String(play.team.id) : "";
+    const athlete = play?.participants?.[0]?.athlete?.id != null ? String(play.participants[0].athlete.id) : "";
+    if (label === "Substitution" || label.includes("Timeout") || (label.includes("Foul") && !label.includes("Turnover"))) continue;
+    if (label.includes("Turnover") && id === teamId) {
+      tov += 1;
+      poss += 1;
+      if (athlete) touch(athlete).tov += 1;
+      continue;
+    }
+    if (label === "Offensive Rebound" && id === teamId) {
+      oreb += 1;
+      continue;
+    }
+    if (label === "Defensive Rebound" && id && id !== teamId) {
+      oppDreb += 1;
+      poss += 1;
+      continue;
+    }
+    const attempted = Number(play?.pointsAttempted ?? 0);
+    const three = attempted === 3 || String(play?.text ?? "").toLowerCase().includes("three");
+    if (play?.shootingPlay && id && id !== teamId && three) {
+      oppTpa += 1;
+      if (play?.scoringPlay) oppTpm += 1;
+    }
+    if (play?.shootingPlay && id === teamId && (attempted === 2 || attempted === 3)) {
+      const row = athlete ? touch(athlete) : null;
+      teamFga += 1;
+      if (three) teamTpa += 1;
+      if (row) {
+        row.fga += 1;
+        if (three) row.tpa += 1;
+        if (play?.scoringPlay && three) row.tpm += 1;
+        if (play?.scoringPlay && !three) row.fg2m += 1;
+      }
+      if (play?.scoringPlay && Number(play?.scoreValue ?? 0) >= 2) poss += 1;
+      continue;
+    }
+    if (label.includes("Free Throw") && id === teamId) {
+      const row = athlete ? touch(athlete) : null;
+      if (row) {
+        row.fta += 1;
+        if (play?.scoringPlay) row.ftm += 1;
+      }
+      if (lastFreeThrow(label) && play?.scoringPlay) poss += 1;
+    }
+  }
+  return { poss, tov, oreb, oppDreb, shots, teamFga, teamTpa, oppTpa, oppTpm };
+}
+
+async function possessionProfile(espnId: string): Promise<PlayProfile | null> {
+  const hit = playCache.get(espnId);
+  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.profile;
+  try {
+    const schedule = await espn(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${espnId}/schedule`);
+    const ids = ((schedule.events ?? []) as any[])
+      .filter((event) => event?.competitions?.[0]?.status?.type?.state === "post")
+      .slice(-5)
+      .map((event) => String(event.id));
+    if (ids.length < 2) {
+      playCache.set(espnId, { at: Date.now(), profile: null });
+      return null;
+    }
+    const games = await pool(ids, 4, (id) =>
+      espn(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${id}`).catch(() => null),
+    );
+    const players = new Map<string, ReturnType<typeof blankShotRow>>();
+    let poss = 0;
+    let tov = 0;
+    let oreb = 0;
+    let oppDreb = 0;
+    let teamFga = 0;
+    let teamTpa = 0;
+    let oppTpa = 0;
+    let oppTpm = 0;
+    let counted = 0;
+    for (const game of games) {
+      if (!game?.plays?.length) continue;
+      const side = readPlays(game.plays, espnId);
+      if (side.poss < 70) continue;
+      counted += 1;
+      poss += side.poss;
+      tov += side.tov;
+      oreb += side.oreb;
+      oppDreb += side.oppDreb;
+      teamFga += side.teamFga;
+      teamTpa += side.teamTpa;
+      oppTpa += side.oppTpa;
+      oppTpm += side.oppTpm;
+      for (const [id, row] of side.shots) {
+        const acc = players.get(id) ?? blankShotRow();
+        acc.fga += row.fga;
+        acc.fg2m += row.fg2m;
+        acc.tpa += row.tpa;
+        acc.tpm += row.tpm;
+        acc.fta += row.fta;
+        acc.ftm += row.ftm;
+        acc.tov += row.tov;
+        players.set(id, acc);
+      }
+      const block = ((game.boxscore?.players ?? []) as any[]).find((item) => String(item?.team?.id) === espnId);
+      const athletes = block?.statistics?.[0]?.athletes ?? [];
+      const seen = new Set<string>();
+      for (const athlete of athletes) {
+        if (athlete?.didNotPlay) continue;
+        const id = athlete?.athlete?.id != null ? String(athlete.athlete.id) : "";
+        if (!id) continue;
+        seen.add(id);
+        const acc = players.get(id) ?? blankShotRow();
+        acc.minutes += minutesOf(String(athlete?.stats?.[0] ?? ""));
+        players.set(id, acc);
+      }
+      for (const id of seen) {
+        const acc = players.get(id);
+        if (acc) acc.games += 1;
+      }
+    }
+    if (counted < 2 || poss <= 0) {
+      playCache.set(espnId, { at: Date.now(), profile: null });
+      return null;
+    }
+    const profile: PlayProfile = {
+      games: counted,
+      pace: clamp(poss / counted, 94, 108),
+      tov: clamp(tov / poss, 0.1, 0.17),
+      orb: clamp(oreb / Math.max(1, oreb + oppDreb), 0.18, 0.36),
+      three: clamp(teamTpa / Math.max(1, teamFga), 0.22, 0.55),
+      oppThree: clamp(oppTpm / Math.max(1, oppTpa), 0.28, 0.45),
+      players,
+    };
+    playCache.set(espnId, { at: Date.now(), profile });
+    return profile;
+  } catch {
+    playCache.set(espnId, { at: Date.now(), profile: null });
+    return null;
+  }
+}
+
+function applyPossession(players: NbaPlayer[], chosen: Chosen[], profile: PlayProfile | null) {
+  if (!profile) return false;
+  for (let i = 0; i < players.length; i++) {
+    const row = profile.players.get(String(chosen[i].athlete.id));
+    const hurt = chosen[i].tag === "Q" || chosen[i].tag === "DTD" ? 0.82 : 1;
+    if (!row || row.games < 1 || row.minutes < 8) {
+      players[i].min = clamp(Math.min(players[i].min, 14) * hurt, 6, 40);
+      continue;
+    }
+    const minutes = row.minutes / row.games;
+    players[i].min = clamp(minutes * hurt, 8, 40);
+    if (row.fga >= 12) {
+      const twos = row.fga - row.tpa;
+      players[i].three = clamp(row.tpa / row.fga, 0.02, 0.75);
+      if (twos >= 6) players[i].fg2 = clamp(row.fg2m / twos, 0.4, 0.78);
+      if (row.tpa >= 6) players[i].fg3 = clamp(row.tpm / row.tpa, 0.26, 0.48);
+      players[i].ftr = clamp(row.fta / row.fga, 0.04, 0.65);
+      if (row.fta >= 6) players[i].ft = clamp(row.ftm / row.fta, 0.5, 0.95);
+      players[i].usg = clamp((row.fga + 0.44 * row.fta + row.tov) / row.minutes, 0.08, 0.85);
+      players[i].tov = clamp(row.tov / row.games, 0.2, 5);
+    }
+  }
+  return true;
 }
 
 async function tuneNba(base: NbaTeam, espnId: string, players: NbaPlayer[], form: Map<string, { for: number; against: number; games: number }>) {
@@ -816,11 +1295,317 @@ async function buildSide(league: League, our: string, espnId: string, report: Ma
       if (wr) wr.tgt = 20;
     }
     const team = await tuneNfl(NFL_BY_ID[our], espnId, players);
-    return { team, spots: spotsOf(chosen), roster: board };
+    const profile = await nflPlayProfile(espnId);
+    const plays = applyNflPlays(team.players, chosen, profile);
+    if (plays && profile) {
+      team.calls = profile.calls;
+      team.passRate = profile.calls.pass;
+    }
+    return { team, spots: spotsOf(chosen), roster: board, plays };
   }
   const players = chosen.map((c, i) => nbaPlayer(c, stats[i] ?? {}));
   const team = await tuneNba(NBA_BY_ID[our], espnId, players, form);
-  return { team, spots: spotsOf(chosen), roster: board };
+  const profile = await possessionProfile(espnId);
+  const plays = applyPossession(team.players, chosen, profile);
+  if (plays && profile) {
+    team.pace = profile.pace;
+    team.tov = profile.tov;
+    team.orb = profile.orb;
+    team.style = { three: profile.three, oppThree: profile.oppThree };
+  }
+  return { team, spots: spotsOf(chosen), roster: board, plays };
+}
+
+type PastGame = { season: number; when: string; state: string; opp: string; margin: number | null };
+
+const schedCache = new Map<string, { at: number; games: PastGame[] }>();
+const coachCache = new Map<string, { at: number; name: string | null }>();
+
+async function teamGames(league: League, espnId: string, season: number): Promise<PastGame[]> {
+  const sport = league === "NFL" ? "football/nfl" : "basketball/nba";
+  const key = `${sport}:${espnId}:${season}`;
+  const hit = schedCache.get(key);
+  if (hit && Date.now() - hit.at < 30 * 60_000) return hit.games;
+  try {
+    const data = await espn(`https://site.api.espn.com/apis/site/v2/sports/${sport}/teams/${espnId}/schedule?season=${season}`);
+    const games: PastGame[] = [];
+    for (const event of data.events ?? []) {
+      const comp = event?.competitions?.[0];
+      const sides = comp?.competitors ?? [];
+      const us = sides.find((side: any) => String(side?.team?.id) === espnId);
+      const them = sides.find((side: any) => String(side?.team?.id) !== espnId);
+      if (!us || !them) continue;
+      const usScore = num(typeof us.score === "object" ? us.score?.value : us.score);
+      const themScore = num(typeof them.score === "object" ? them.score?.value : them.score);
+      games.push({
+        season,
+        when: String(event.date ?? ""),
+        state: String(comp?.status?.type?.state ?? ""),
+        opp: String(them.team.id),
+        margin: usScore != null && themScore != null ? usScore - themScore : null,
+      });
+    }
+    schedCache.set(key, { at: Date.now(), games });
+    return games;
+  } catch {
+    schedCache.set(key, { at: Date.now(), games: [] });
+    return [];
+  }
+}
+
+async function headCoach(league: League, espnId: string, year: number): Promise<string | null> {
+  const sport = league === "NFL" ? "football/leagues/nfl" : "basketball/leagues/nba";
+  const key = `${sport}:${year}:${espnId}`;
+  const hit = coachCache.get(key);
+  if (hit && Date.now() - hit.at < 6 * 3600_000) return hit.name;
+  try {
+    const list = await espn(`https://sports.core.api.espn.com/v2/sports/${sport}/seasons/${year}/teams/${espnId}/coaches?limit=5`);
+    const ref = list.items?.[0]?.$ref;
+    if (!ref) {
+      coachCache.set(key, { at: Date.now(), name: null });
+      return null;
+    }
+    const coach = await espn(String(ref));
+    const name = [coach.firstName, coach.lastName].filter(Boolean).join(" ").trim();
+    coachCache.set(key, { at: Date.now(), name: name || null });
+    return name || null;
+  } catch {
+    coachCache.set(key, { at: Date.now(), name: null });
+    return null;
+  }
+}
+
+function restDays(games: PastGame[], whenIso: string) {
+  const when = Date.parse(whenIso);
+  if (!Number.isFinite(when)) return null;
+  let last = 0;
+  for (const game of games) {
+    if (game.state !== "post") continue;
+    const stamp = Date.parse(game.when);
+    if (Number.isFinite(stamp) && stamp < when - 6 * 3600_000 && stamp > last) last = stamp;
+  }
+  if (!last) return null;
+  return (when - last) / 86400000;
+}
+
+function restMul(league: League, days: number | null) {
+  if (days == null) return 1;
+  if (league === "NFL") {
+    if (days < 6) return 0.986;
+    if (days > 10) return 1.01;
+    return 1;
+  }
+  if (days < 1.55) return 0.974;
+  if (days >= 2.6) return 1.008;
+  return 1;
+}
+
+function marginPair(rows: PastGame[], div: number, cap: number, minN: number): [number, number] {
+  const scored = rows.filter((row) => row.margin != null);
+  if (scored.length < minN) return [1, 1];
+  const avg = scored.reduce((sum, row) => sum + (row.margin ?? 0), 0) / scored.length;
+  return [1 + clamp(avg / div, -cap, cap), 1 + clamp(-avg / div, -cap, cap)];
+}
+
+function formOf(parts: number[]) {
+  return clamp(
+    parts.reduce((product, part) => product * part, 1),
+    0.93,
+    1.07,
+  );
+}
+
+function injuryMul(spots: LiveSpot[]) {
+  const replaced = spots.filter((spot) => spot.note.startsWith("in for")).length;
+  const qbDown = spots.some((spot) => spot.pos === "QB" && spot.note.startsWith("in for"));
+  return clamp(1 - replaced * 0.012 - (qbDown ? 0.025 : 0), 0.94, 1);
+}
+
+function qbHealth(spots: LiveSpot[]) {
+  const qb = spots.find((spot) => spot.pos === "QB");
+  return qb && (qb.tag === "Q" || qb.tag === "DTD") ? 0.95 : 1;
+}
+
+function listNames(rows: string[]) {
+  if (rows.length <= 3) return rows.join(", ");
+  return `${rows.slice(0, 3).join(", ")} and ${rows.length - 3} more`;
+}
+
+function injuryBits(spots: LiveSpot[], abbr: string) {
+  const out = spots.filter((spot) => spot.note.startsWith("in for")).map((spot) => spot.note.replace(/^in for /, ""));
+  const dinged = spots.filter((spot) => spot.tag === "Q" || spot.tag === "DTD").map((spot) => `${spot.name} ${spot.tag}`);
+  const bits: string[] = [];
+  if (out.length) bits.push(`${abbr} without ${listNames(out)}`);
+  if (dinged.length) bits.push(`${listNames(dinged)} limited`);
+  return bits;
+}
+
+function nflStyle(off: NflTeam["shape"], def: NflTeam["shape"]) {
+  if (!off || !def) return { run: 1, pass: 1, sack: 1, call: 0, gap: 0 };
+  const runScore = off.rushYpg / Math.max(70, def.rushAllowed);
+  const passScore = off.passYpg / Math.max(140, def.passAllowed);
+  const gap = runScore - passScore;
+  const pressure = (def.sacksMade / 2.3) * (off.sacksAllowed / 2.3);
+  return {
+    run: clamp(1 + gap * 0.1, 0.95, 1.06),
+    pass: clamp(1 - gap * 0.1, 0.95, 1.06),
+    sack: clamp(1 + (pressure - 1) * 0.55, 0.78, 1.35),
+    call: clamp(-gap * 0.1, -0.06, 0.06),
+    gap,
+  };
+}
+
+function styleBits(off: string, def: string, style: ReturnType<typeof nflStyle>) {
+  const bits: string[] = [];
+  if (style.gap >= 0.08) bits.push(`${off} run game vs a softer ${def} rush defense`);
+  else if (style.gap <= -0.08) bits.push(`${off} pass game vs a softer ${def} pass defense`);
+  if (style.sack >= 1.15) bits.push(`${def} pressure vs ${off}'s protection`);
+  else if (style.sack <= 0.86) bits.push(`${off} keeps ${def}'s pass rush quiet`);
+  return bits;
+}
+
+async function paintContext(input: {
+  league: League;
+  year: number;
+  awayId: string;
+  homeId: string;
+  awayEspn: string;
+  homeEspn: string;
+  when: string | null;
+  away: NflTeam | NbaTeam;
+  home: NflTeam | NbaTeam;
+  awaySpots: LiveSpot[];
+  homeSpots: LiveSpot[];
+}) {
+  const seasons = [input.year - 2, input.year - 1, input.year];
+  const [awayCoach, homeCoach, awayPack, homeNow] = await Promise.all([
+    headCoach(input.league, input.awayEspn, input.year),
+    headCoach(input.league, input.homeEspn, input.year),
+    Promise.all(seasons.map((season) => teamGames(input.league, input.awayEspn, season))),
+    teamGames(input.league, input.homeEspn, input.year),
+  ]);
+  const history = awayPack.flat();
+  const tip = input.when ? Date.parse(input.when) : NaN;
+  const met = history.filter((game) => {
+    if (game.opp !== input.homeEspn || game.state !== "post" || game.margin == null) return false;
+    const stamp = Date.parse(game.when);
+    if (Number.isFinite(tip) && Number.isFinite(stamp) && stamp >= tip - 6 * 3600_000) return false;
+    return true;
+  });
+  const prior = met.filter((game) => game.season < input.year);
+  const current = met.filter((game) => game.season === input.year);
+  const awayDays = input.when ? restDays(awayPack[2] ?? [], input.when) : null;
+  const homeDays = input.when ? restDays(homeNow, input.when) : null;
+  const [h2hAway, h2hHome] = marginPair(prior, 36, 0.025, 2);
+  const [coachAway, coachHome] = marginPair(current, 50, 0.02, 1);
+  const bits: string[] = [];
+  bits.push(...injuryBits(input.awaySpots, input.awayId), ...injuryBits(input.homeSpots, input.homeId));
+  if (awayDays != null && ((input.league === "NFL" && awayDays < 6) || (input.league === "NBA" && awayDays < 1.55))) {
+    bits.push(input.league === "NFL" ? `${input.awayId} on a short week` : `${input.awayId} on a back-to-back`);
+  }
+  if (homeDays != null && ((input.league === "NFL" && homeDays < 6) || (input.league === "NBA" && homeDays < 1.55))) {
+    bits.push(input.league === "NFL" ? `${input.homeId} on a short week` : `${input.homeId} on a back-to-back`);
+  }
+  if (awayCoach && homeCoach) {
+    if (!current.length) bits.push(`Head coaches ${awayCoach} and ${homeCoach}, first meeting`);
+    else {
+      let wins = 0;
+      let losses = 0;
+      let ties = 0;
+      for (const game of current) {
+        if ((game.margin ?? 0) > 0) wins += 1;
+        else if ((game.margin ?? 0) < 0) losses += 1;
+        else ties += 1;
+      }
+      const record = ties ? `${wins}–${losses}–${ties}` : `${wins}–${losses}`;
+      bits.push(`Head coaches: ${awayCoach} ${record} vs ${homeCoach} this season`);
+    }
+  }
+  if (prior.length >= 2) {
+    const avg = prior.reduce((sum, game) => sum + (game.margin ?? 0), 0) / prior.length;
+    bits.push(`Last ${prior.length} meetings ${input.awayId} ${avg >= 0 ? "+" : ""}${avg.toFixed(1)}`);
+  }
+  if (input.league === "NFL") {
+    const away = input.away as NflTeam;
+    const home = input.home as NflTeam;
+    const venue = NFL_VENUE[input.homeId];
+    const dome = Boolean(venue?.dome);
+    const sky = input.when && venue && !dome ? await skyAt(venue.lat, venue.lon, input.when) : null;
+    const wind = dome ? 0 : (sky?.windMph ?? null);
+    away.windMph = wind;
+    home.windMph = wind;
+    const wet = Boolean(!dome && sky?.wet);
+    const cold = Boolean(!dome && sky?.tempF != null && sky.tempF <= 34);
+    const awayStyle = nflStyle(away.shape, home.shape);
+    const homeStyle = nflStyle(home.shape, away.shape);
+    const divisional = away.conf === home.conf && away.div === home.div;
+    const altitude = input.homeId === "DEN" && !dome;
+    away.spot = {
+      run: awayStyle.run,
+      pass: awayStyle.pass,
+      sack: awayStyle.sack,
+      call: awayStyle.call,
+      form: formOf([restMul(input.league, awayDays), altitude ? 0.98 : 1, divisional ? 1.006 : 1, injuryMul(input.awaySpots), h2hAway, coachAway]),
+      wet,
+      cold,
+      qb: qbHealth(input.awaySpots),
+    };
+    home.spot = {
+      run: homeStyle.run,
+      pass: homeStyle.pass,
+      sack: homeStyle.sack,
+      call: homeStyle.call,
+      form: formOf([restMul(input.league, homeDays), altitude ? 1.012 : 1, injuryMul(input.homeSpots), h2hHome, coachHome]),
+      wet,
+      cold,
+      qb: qbHealth(input.homeSpots),
+    };
+    if (dome) bits.unshift("Indoors");
+    else if (sky) {
+      const skyBits = [
+        sky.windMph != null ? `Wind ${Math.round(sky.windMph)} mph` : "",
+        sky.tempF != null ? `${Math.round(sky.tempF)}°F` : "",
+        sky.wet ? (sky.tempF != null && sky.tempF <= 34 ? "snow" : "rain") : "",
+      ].filter(Boolean);
+      if (skyBits.length) bits.unshift(skyBits.join(", "));
+    } else if (input.when) bits.unshift("Weather did not answer");
+    bits.push(...styleBits(input.awayId, input.homeId, awayStyle), ...styleBits(input.homeId, input.awayId, homeStyle));
+    if (altitude) bits.push("Altitude in Denver");
+    if (divisional) bits.push("Divisional");
+  } else {
+    const away = input.away as NbaTeam;
+    const home = input.home as NbaTeam;
+    const threeOf = (off: NbaTeam, def: NbaTeam) => {
+      if (!off.style || !def.style) return 1;
+      const tilt = off.style.three - 0.36 + (def.style.oppThree - 0.36);
+      return clamp(1 + tilt * 0.35, 0.96, 1.05);
+    };
+    const tovOf = (off: NbaTeam, def: NbaTeam) => clamp(1 + (off.tov - 0.13) * 0.8 + (def.def - 1) * 0.25, 0.92, 1.1);
+    away.spot = {
+      three: threeOf(away, home),
+      tov: tovOf(away, home),
+      form: formOf([restMul(input.league, awayDays), injuryMul(input.awaySpots), h2hAway, coachAway]),
+    };
+    home.spot = {
+      three: threeOf(home, away),
+      tov: tovOf(home, away),
+      form: formOf([restMul(input.league, homeDays), injuryMul(input.homeSpots), h2hHome, coachHome]),
+    };
+    bits.unshift("Indoors");
+    if (away.style && home.style && away.style.three >= 0.4 && home.style.oppThree >= 0.375) {
+      bits.push(`${input.awayId} threes vs a defense that has been giving them up`);
+    } else if (away.style && home.style && away.style.three >= 0.4 && home.style.oppThree <= 0.33) {
+      bits.push(`${input.homeId} has been taking the three away`);
+    }
+    if (home.style && away.style && home.style.three >= 0.4 && away.style.oppThree >= 0.375) {
+      bits.push(`${input.homeId} threes vs a defense that has been giving them up`);
+    } else if (home.style && away.style && home.style.three >= 0.4 && away.style.oppThree <= 0.33) {
+      bits.push(`${input.awayId} has been taking the three away`);
+    }
+    if (away.tov >= 0.145 && home.def >= 1.03) bits.push(`${input.awayId} turns it over against this defense`);
+    if (home.tov >= 0.145 && away.def >= 1.03) bits.push(`${input.homeId} turns it over against this defense`);
+  }
+  return bits.join(". ");
 }
 
 export async function pullMatchup(input: { league: League; awayId: string; homeId: string; force?: boolean }): Promise<LiveLineup> {
@@ -867,32 +1652,49 @@ export async function pullMatchup(input: { league: League; awayId: string; homeI
           weight,
         }
       : null;
-  let wind: number | null = null;
-  if (league === "NFL" && event) {
-    const venue = NFL_VENUE[event.homeId];
-    if (venue?.dome) wind = 0;
-    else if (venue) wind = await windAt(venue.lat, venue.lon, event.when);
-  }
   if (league === "NFL") {
     const awayNfl = awaySide.team as NflTeam;
     const homeNfl = homeSide.team as NflTeam;
     awayNfl.line = line;
     homeNfl.line = line;
-    awayNfl.windMph = wind;
-    homeNfl.windMph = wind;
   } else {
     const awayNba = awaySide.team as NbaTeam;
     const homeNba = homeSide.team as NbaTeam;
     awayNba.line = line;
     homeNba.line = line;
   }
+  const factors = await paintContext({
+    league,
+    year: slate.year,
+    awayId,
+    homeId,
+    awayEspn,
+    homeEspn,
+    when: event?.when ?? null,
+    away: awaySide.team,
+    home: homeSide.team,
+    awaySpots: awaySide.spots,
+    homeSpots: homeSide.spots,
+  });
+  const played = league === "NFL" ? "pace, calls, turnovers, rotation" : "pace, shot profile, turnovers, rotation";
+  const base =
+    (league === "NFL" && awaySide.plays && homeSide.plays) || (league === "NBA" && awaySide.plays && homeSide.plays)
+      ? `Play-by-play · ${played}`
+      : event
+        ? `ESPN roster and injury report`
+        : `ESPN active roster · ${season} · not on today's slate`;
   const value: LiveLineup = {
     league,
     awayId,
     homeId,
     pulledAt: Date.now(),
-    source: `ESPN active roster · ${season} season`,
-    warning: flipped && event ? `The live game is ${event.awayAbbr} at ${event.homeAbbr}. This sim keeps the home team you picked.` : null,
+    source: `${base} · weather, matchup, injuries, coaches, head-to-head${event ? ` · ${whenLabel(event.when)}` : ""}`,
+    factors: factors || null,
+    warning: event
+      ? flipped
+        ? `The live game is ${event.awayAbbr} at ${event.homeAbbr}. This sim keeps the home team you picked.`
+        : null
+      : "These teams are not on today's slate. This is the current roster, not that game's lineup.",
     slate: event
       ? {
           label: `${event.awayAbbr} at ${event.homeAbbr}`,
@@ -910,4 +1712,117 @@ export async function pullMatchup(input: { league: League; awayId: string; homeI
   };
   lineupCache.set(key, { at: Date.now(), value });
   return value;
+}
+
+const propCache = new Map<string, { at: number; value: PropBoardData }>();
+
+function athleteId(ref: unknown) {
+  const match = String(ref ?? "").match(/athletes\/(\d+)/);
+  return match?.[1] ?? "";
+}
+
+function propLine(item: any, market: ReturnType<typeof marketOf>) {
+  if (!market) return null;
+  if (isBinary(market)) return 0.5;
+  const value = item?.current?.target?.value ?? item?.odds?.total?.value;
+  const line = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(line) ? line : null;
+}
+
+export async function listedProps(input: { league: League; awayId: string; homeId: string }): Promise<PropBoardData> {
+  const { league, awayId, homeId } = input;
+  const slate = await board(league);
+  const event = slate.events.find(
+    (row) =>
+      (row.awayId === awayId && row.homeId === homeId) || (row.awayId === homeId && row.homeId === awayId),
+  );
+  const label = event ? `${event.awayAbbr} at ${event.homeAbbr}` : `${awayId} at ${homeId}`;
+  if (!event) {
+    return {
+      book: "DraftKings",
+      label,
+      props: [],
+      note: "These teams are not on the current board, so there is no listed prop for this game.",
+    };
+  }
+  const cacheKey = `${league}:${event.id}`;
+  const hit = propCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < 2 * 60_000) return hit.value;
+  const sportPath = league === "NFL" ? "football/leagues/nfl" : "basketball/leagues/nba";
+  const rosterSport = league === "NFL" ? "football/nfl" : "basketball/nba";
+  try {
+    const [awayRoster, homeRoster] = await Promise.all([
+      loadRoster(rosterSport, event.awayEspn),
+      loadRoster(rosterSport, event.homeEspn),
+    ]);
+    const who = new Map<string, { name: string; pos: string; teamId: string }>();
+    for (const row of awayRoster) who.set(row.id, { name: row.name, pos: row.pos === "PK" ? "K" : row.pos === "FB" ? "RB" : row.pos, teamId: event.awayId });
+    for (const row of homeRoster) who.set(row.id, { name: row.name, pos: row.pos === "PK" ? "K" : row.pos === "FB" ? "RB" : row.pos, teamId: event.homeId });
+    const items: any[] = [];
+    let loaded = false;
+    // ESPN 404s NBA prop pages above 400. NFL still accepts 500, so try the
+    // larger page first and fall back rather than failing the whole board.
+    for (const limit of [400, 200, 100]) {
+      try {
+        items.length = 0;
+        let page = 1;
+        let pageCount = 1;
+        while (page <= pageCount && page <= 8) {
+          const data = await espn(
+            `https://sports.core.api.espn.com/v2/sports/${sportPath}/events/${event.id}/competitions/${event.id}/odds/100/propBets?lang=en&region=us&limit=${limit}&page=${page}`,
+          );
+          pageCount = Number(data.pageCount ?? 1) || 1;
+          const batch = (data.items ?? []) as any[];
+          items.push(...batch);
+          if (!batch.length) break;
+          page += 1;
+        }
+        loaded = true;
+        break;
+      } catch {
+        // try the next page size
+      }
+    }
+    if (!loaded) throw new Error("prop board");
+    const props = new Map<string, ListedProp>();
+    for (const item of items) {
+      const market = marketOf(String(item?.type?.name ?? ""));
+      const line = propLine(item, market);
+      const id = athleteId(item?.athlete?.$ref);
+      const player = who.get(id);
+      if (!market || line == null || !player) continue;
+      const key = `${id}:${market}`;
+      props.set(key, {
+        id: key,
+        player: player.name,
+        teamId: player.teamId,
+        pos: player.pos,
+        market,
+        label: PROP_LABEL[market],
+        line,
+        binary: isBinary(market),
+      });
+    }
+    const list = [...props.values()].sort((a, b) => {
+      if (a.teamId !== b.teamId) return a.teamId === awayId ? -1 : 1;
+      const byName = a.player.localeCompare(b.player);
+      if (byName !== 0) return byName;
+      return marketRank(a.market) - marketRank(b.market);
+    });
+    const value: PropBoardData = {
+      book: event.book || "DraftKings",
+      label,
+      props: list,
+      note: list.length ? null : "The book has not posted player props for this game yet.",
+    };
+    propCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  } catch {
+    return {
+      book: event.book || "DraftKings",
+      label,
+      props: [],
+      note: "The prop board did not answer. Try again in a minute.",
+    };
+  }
 }

@@ -16,6 +16,44 @@ export type NflPlayer = {
 export type NflDiv = "East" | "North" | "South" | "West";
 export type NflConf = "AFC" | "NFC";
 
+export type NflCalls = {
+  drives: number;
+  plays: number;
+  sec: number;
+  ypp: number;
+  pass: number;
+  passLead: number;
+  passTrail: number;
+  passShort: number;
+  passLong: number;
+  td: number;
+  fg: number;
+  to: number;
+  go4: number;
+};
+
+export type NflShape = {
+  rushYpg: number;
+  passYpg: number;
+  ypc: number;
+  sacksAllowed: number;
+  sacksMade: number;
+  rushAllowed: number;
+  passAllowed: number;
+  ypcAllowed: number;
+};
+
+export type NflSpot = {
+  run: number;
+  pass: number;
+  sack: number;
+  call: number;
+  form: number;
+  wet: boolean;
+  cold: boolean;
+  qb: number;
+};
+
 export type NflTeam = {
   id: string;
   city: string;
@@ -38,6 +76,11 @@ export type NflTeam = {
   gamesPlayed?: number;
   windMph?: number | null;
   line?: MarketLine | null;
+  calls?: NflCalls;
+  /** Season rates used to spot a style mismatch against this opponent. */
+  shape?: NflShape;
+  /** This game only. Missing means a neutral sim. */
+  spot?: NflSpot;
 };
 
 const z = { rush: 0, tgt: 0, ypc: 4.3, ypr: 11, comp: 0.65, ypa: 7.2, int: 0.021, fg: 0.85 };

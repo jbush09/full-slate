@@ -1,4 +1,4 @@
-import type { NflTeam } from "@/data/nfl";
+import type { NflCalls, NflTeam } from "@/data/nfl";
 import { allocate, binomial, blendScore, clamp, clampInt, fitToTarget, normal, scaleToSum, skewed, weightedIndex, type Rng } from "@/lib/sim/random";
 import type { Drive, NflGame, NflPlayerLine, NflProj, NflProjPlayer, NflSide, NflTeamAvg } from "@/lib/sim/types";
 
@@ -11,11 +11,20 @@ type Built = {
   detail: string;
   passYd: number;
   rushYd: number;
+  grossPass: number;
   scorer: string | null;
   scoreKind: "pass" | "rush" | null;
   fgMade: boolean;
   fgAtt: boolean;
   turnover: "int" | "fumble" | null;
+  thirdMade: number;
+  thirdAtt: number;
+  spot: number;
+  passPlays: number;
+  rushPlays: number;
+  sacks: number;
+  sackYds: number;
+  firstDowns: number;
 };
 
 function qbOf(team: NflTeam) {
@@ -34,49 +43,63 @@ function edgeOf(off: NflTeam, def: NflTeam, home: boolean) {
   return (o / d) * (home ? 1.045 : 0.985);
 }
 
-type Script = { lead: number; quarter: number; wind: number };
+type Script = { lead: number; quarter: number; wind: number; start?: number; maxPlays?: number; hurry?: boolean };
+
+function callsOf(off: NflTeam): NflCalls {
+  const pass = off.passRate;
+  return (
+    off.calls ?? {
+      drives: 11,
+      plays: 6.2,
+      sec: 28,
+      ypp: 5.4,
+      pass,
+      passLead: clamp(pass - 0.12, 0.34, 0.78),
+      passTrail: clamp(pass + 0.1, 0.4, 0.84),
+      passShort: clamp(pass - 0.14, 0.28, 0.7),
+      passLong: clamp(pass + 0.16, 0.48, 0.86),
+      td: 0.22,
+      fg: 0.14,
+      to: clamp(0.11 * off.toGive, 0.05, 0.22),
+      go4: 0.28,
+    }
+  );
+}
+
+/** Completion or rush yards. Mean is set so a league snap lands near 5.4 yards once sacks and incompletions are included. */
+function chunkGain(isPass: boolean, rng: Rng, scale: number) {
+  const u = rng();
+  if (isPass) {
+    const base =
+      u < 0.46 ? skewed(rng, 3.6, 1.4) : u < 0.74 ? skewed(rng, 9, 2) : u < 0.91 ? skewed(rng, 16.2, 3) : skewed(rng, 28.5, 6);
+    return Math.round(clamp(base * scale, 0, 60));
+  }
+  const base =
+    u < 0.3 ? skewed(rng, -0.6, 1.1) : u < 0.68 ? skewed(rng, 2.9, 1.15) : u < 0.9 ? skewed(rng, 6.4, 1.7) : skewed(rng, 14.2, 3.6);
+  return Math.round(clamp(base * scale, -5, 55));
+}
 
 function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng, script: Script = { lead: 0, quarter: 2, wind: off.windMph ?? 0 }): Built {
-  const edge = edgeOf(off, def, home);
-  let tdP = clamp(0.2 * edge * off.rz, 0.07, 0.4);
-  let toP = clamp(0.1 * (off.toGive / def.toTake), 0.035, 0.2);
-  let fgaP = clamp(0.16 * (0.85 + 0.15 * edge) * (0.92 + 0.08 * off.st), 0.06, 0.28);
-  if (script.quarter >= 3 && script.lead >= 14) {
-    tdP *= script.quarter >= 4 ? 0.78 : 0.88;
-    fgaP *= 0.9;
-  } else if (script.quarter >= 4 && script.lead <= -10) {
-    tdP *= 1.06;
-    fgaP *= 0.9;
-  }
-  let sum = tdP + toP + fgaP;
-  if (sum > 0.9) {
-    const s = 0.9 / sum;
-    tdP *= s;
-    toP *= s;
-    fgaP *= s;
-    sum = 0.9;
-  }
-  const rest = 1 - sum;
-  const downsP = rest * 0.16;
-  const roll = rng();
-  let kind: "TD" | "FGA" | "TO" | "DOWNS" | "PUNT" = "PUNT";
-  if (roll < tdP) kind = "TD";
-  else if (roll < tdP + fgaP) kind = "FGA";
-  else if (roll < tdP + fgaP + toP) kind = "TO";
-  else if (roll < tdP + fgaP + toP + downsP) kind = "DOWNS";
-
+  const edge = clamp(edgeOf(off, def, home), 0.84, 1.2);
+  const calls = callsOf(off);
   const qb = qbOf(off);
   const kicker = kickerOf(off);
   const skill = off.players.filter((p) => p.pos !== "K");
-  let passRate = off.passRate;
-  if (script.quarter >= 3 && script.lead >= 14) passRate -= script.quarter >= 4 ? 0.16 : 0.1;
-  else if (script.quarter >= 4 && script.lead <= -10) passRate += 0.08;
-  if (script.wind >= 15) passRate -= Math.min(0.14, (script.wind - 12) * 0.008);
-  passRate = clamp(passRate, 0.34, 0.78);
-
-  let yards = 0;
-  let plays = 3;
-  let result: Drive["result"] = "PUNT";
+  let ytg = clampInt(script.start ?? skewed(rng, 70, 3), 6, 92);
+  const start = ytg;
+  let down = 1;
+  let toGo = 10;
+  let plays = 0;
+  let grossPass = 0;
+  let sackYds = 0;
+  let rushYd = 0;
+  let thirdMade = 0;
+  let thirdAtt = 0;
+  let passPlays = 0;
+  let rushPlays = 0;
+  let sacks = 0;
+  let firstDowns = 0;
+  let result: Drive["result"] | null = null;
   let detail = "Punt";
   let points = 0;
   let scorer: string | null = null;
@@ -84,19 +107,19 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng, script:
   let fgMade = false;
   let fgAtt = false;
   let turnover: "int" | "fumble" | null = null;
+  const toPlay = clamp((calls.to / Math.max(3.2, calls.plays)) * (off.toGive / Math.max(0.75, def.toTake)), 0.006, 0.04);
+  const spot = off.spot;
+  const scale = clamp((calls.ypp / 5.12) * edge * (spot?.form ?? 1), 0.7, 1.36);
+  const cap = clampInt(script.maxPlays ?? 14, 1, 14);
 
-  if (kind === "TD") {
-    yards = clampInt(skewed(rng, 62, 18), 8, 99);
-    plays = clampInt(normal(rng, 8.2, 2), 1, 15);
-    const passBias = clamp(passRate + 0.08, 0.38, 0.82);
-    const isPass = rng() < passBias;
+  const finishTd = (isPass: boolean) => {
     if (isPass) {
       const receivers = skill.filter((p) => p.pos !== "QB" && p.tgt > 0);
       const idx = weightedIndex(
         rng,
-        receivers.map((p) => p.tgt * (p.pos === "TE" ? 1.15 : p.pos === "RB" ? 0.75 : 1)),
+        receivers.map((p) => p.tgt * (p.pos === "TE" ? 1.15 : p.pos === "RB" ? 0.7 : 1)),
       );
-      scorer = receivers[idx]?.name ?? receivers[0].name;
+      scorer = receivers[idx]?.name ?? qb.name;
       scoreKind = "pass";
       detail = `${qb.name} to ${scorer}`;
     } else {
@@ -113,45 +136,121 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng, script:
     points = xp ? 7 : 6;
     detail += xp ? "" : ", extra point missed";
     result = "TD";
-  } else if (kind === "FGA") {
-    yards = clampInt(normal(rng, 44, 11), 12, 68);
-    plays = clampInt(normal(rng, 7.4, 1.7), 3, 14);
-    const dist = clampInt(92 - yards, 22, 58);
-    let make = kicker.fg;
-    if (dist >= 50) make -= (dist - 50) * 0.035;
-    else if (dist <= 35) make += 0.06;
-    if (script.wind >= 15 && dist >= 40) make -= Math.min(0.16, (script.wind - 12) * 0.007);
-    make = clamp(make * (0.92 + 0.08 * off.st), 0.28, 0.97);
-    fgAtt = true;
-    fgMade = rng() < make;
-    points = fgMade ? 3 : 0;
-    result = fgMade ? "FG" : "MISS";
-    detail = fgMade ? `${kicker.name} from ${dist}` : `${kicker.name} missed from ${dist}`;
-  } else if (kind === "TO") {
-    yards = clampInt(normal(rng, 16, 10), 0, 42);
-    plays = clampInt(normal(rng, 4.6, 1.5), 1, 11);
-    const isInt = rng() < 0.62;
-    turnover = isInt ? "int" : "fumble";
-    result = "TO";
-    detail = isInt ? `${qb.name} intercepted` : "Fumble lost";
-  } else if (kind === "DOWNS") {
-    yards = clampInt(normal(rng, 34, 10), 8, 58);
-    plays = clampInt(normal(rng, 6.8, 1.4), 4, 12);
-    result = "DOWNS";
-    detail = "Turned over on downs";
-  } else {
-    yards = clampInt(normal(rng, 13, 8), 0, 36);
-    plays = clampInt(normal(rng, 4.1, 1.2), 3, 8);
+    firstDowns += 1;
+    ytg = 0;
+  };
+
+  for (let n = 0; n < cap && result == null; n++) {
+    if (down === 4) {
+      const dist = clampInt(ytg + 17, 18, 68);
+      const inRange = dist <= 52 || (dist <= 57 && kicker.fg >= 0.84 && script.wind < 15);
+      let goP = calls.go4 * (script.quarter >= 4 && script.lead < 0 ? 1.4 : 1);
+      if (script.hurry && script.lead < 0) goP = Math.max(goP, 0.62);
+      if (ytg <= 2) goP = Math.max(goP, 0.8);
+      const go = toGo <= 3 && ytg <= 58 && rng() < goP;
+      if (!go && inRange) {
+        let make = kicker.fg;
+        if (dist >= 50) make -= (dist - 50) * 0.038;
+        else if (dist <= 35) make += 0.06;
+        if (script.wind >= 15 && dist >= 40) make -= Math.min(0.16, (script.wind - 12) * 0.007);
+        if (spot?.wet) make -= 0.04;
+        if (spot?.cold) make -= 0.03;
+        make = clamp(make * (0.92 + 0.08 * off.st), 0.28, 0.97);
+        fgAtt = true;
+        fgMade = rng() < make;
+        points = fgMade ? 3 : 0;
+        result = fgMade ? "FG" : "MISS";
+        detail = fgMade ? `${kicker.name} from ${dist}` : `${kicker.name} missed from ${dist}`;
+        break;
+      }
+      if (!go) {
+        result = "PUNT";
+        detail = script.maxPlays != null && script.maxPlays <= 2 && script.quarter >= 4 ? "End of half" : "Punt";
+        break;
+      }
+    }
+
+    let passP = calls.pass;
+    if (script.quarter >= 4 && script.lead >= 8) passP = calls.passLead;
+    else if (script.quarter >= 4 && script.lead <= -8) passP = calls.passTrail;
+    if (toGo <= 2) passP = calls.passShort;
+    if (down >= 3 && toGo >= 7) passP = calls.passLong;
+    if (ytg <= 8 && toGo <= 6) passP = Math.min(passP, calls.passShort + 0.06);
+    if (script.wind >= 15) passP -= Math.min(0.12, (script.wind - 12) * 0.008);
+    if (spot) passP += spot.call;
+    if (spot?.wet) passP -= 0.04;
+    if (spot?.cold) passP -= 0.03;
+    if (script.hurry && script.lead < 0) passP = Math.max(passP, calls.passTrail);
+    passP = clamp(passP, 0.28, 0.88);
+    const isPass = rng() < passP;
+    const onThird = down === 3;
+    if (onThird) thirdAtt += 1;
+    plays += 1;
+    if (isPass) passPlays += 1;
+    else rushPlays += 1;
+
+    if (isPass && rng() < toPlay * 1.15) {
+      turnover = "int";
+      result = "TO";
+      detail = `${qb.name} intercepted`;
+      break;
+    }
+    if (!isPass && rng() < toPlay * 0.7 * (spot?.wet ? 1.4 : 1)) {
+      turnover = "fumble";
+      result = "TO";
+      detail = "Fumble lost";
+      break;
+    }
+
+    let gain = 0;
+    if (isPass) {
+      const sackP = clamp(0.062 * (def.passDef / Math.max(0.75, off.passOff)) * (spot?.sack ?? 1) * (spot && spot.qb < 1 ? 1.12 : 1), 0.025, 0.14);
+      if (rng() < sackP) {
+        gain = -clampInt(skewed(rng, 6.2, 1.6), 1, 14);
+        sacks += 1;
+        sackYds += -gain;
+      } else if (rng() > clamp(qb.comp * (0.94 + 0.08 * edge) * (spot?.pass ?? 1) * (spot?.qb ?? 1) * (spot?.wet ? 0.96 : 1) * (spot?.cold ? 0.985 : 1), 0.46, 0.76)) {
+        gain = 0;
+      } else {
+        gain = chunkGain(true, rng, scale);
+        if (spot) gain = Math.round(gain * spot.pass);
+        if (script.wind >= 15 && gain > 16) gain = Math.round(gain * 0.84);
+      }
+    } else {
+      gain = chunkGain(false, rng, scale);
+      if (spot) gain = Math.round(gain * spot.run);
+    }
+    if (gain > ytg) gain = ytg;
+    if (isPass) grossPass += Math.max(0, gain);
+    else rushYd += gain;
+    ytg -= gain;
+    if (onThird && gain >= toGo) thirdMade += 1;
+    if (ytg <= 0) {
+      finishTd(isPass);
+      break;
+    }
+    if (gain >= toGo) {
+      firstDowns += 1;
+      down = 1;
+      toGo = Math.min(10, ytg);
+    } else {
+      down += 1;
+      toGo = Math.max(1, toGo - gain);
+      if (down > 4) {
+        result = "DOWNS";
+        detail = "Turned over on downs";
+        break;
+      }
+    }
+  }
+
+  if (result == null) {
     result = "PUNT";
     detail = "Punt";
   }
-
-  const share = clamp(passRate + (qb.ypa - 7.2) * 0.04 + normal(rng, 0, 0.06), 0.32, 0.8);
-  const passYd = Math.round(yards * share);
-  const rushYd = yards - passYd;
-  if (script.quarter >= 4 && script.lead >= 14) {
-    plays = Math.max(3, Math.round(plays * 0.9));
-  }
+  if (plays === 0) plays = 1;
+  const netPass = grossPass - sackYds;
+  const yards = Math.max(0, start - ytg);
 
   return {
     abbr: off.abbr,
@@ -160,14 +259,60 @@ function buildDrive(off: NflTeam, def: NflTeam, home: boolean, rng: Rng, script:
     yards,
     points,
     detail,
-    passYd,
+    passYd: netPass,
     rushYd,
+    grossPass,
     scorer,
     scoreKind,
     fgMade,
     fgAtt,
     turnover,
+    thirdMade,
+    thirdAtt,
+    spot: ytg,
+    passPlays,
+    rushPlays,
+    sacks,
+    sackYds,
+    firstDowns,
   };
+}
+
+function kneelDrive(off: NflTeam, ytg: number): Built {
+  return {
+    abbr: off.abbr,
+    result: "PUNT",
+    plays: 3,
+    yards: 0,
+    points: 0,
+    detail: "Kneel",
+    passYd: 0,
+    rushYd: 0,
+    grossPass: 0,
+    scorer: null,
+    scoreKind: null,
+    fgMade: false,
+    fgAtt: false,
+    turnover: null,
+    thirdMade: 0,
+    thirdAtt: 0,
+    spot: ytg,
+    passPlays: 0,
+    rushPlays: 3,
+    sacks: 0,
+    sackYds: 0,
+    firstDowns: 0,
+  };
+}
+
+function nextSpot(d: Built, rng: Rng) {
+  if (d.result === "TD" || d.result === "FG") return clampInt(skewed(rng, 70, 1.6), 66, 75);
+  if (d.result === "PUNT" && d.detail !== "Kneel" && d.detail !== "End of half") {
+    const net = clampInt(skewed(rng, 40, 3.5), 30, 50);
+    if (net >= d.spot) return 80;
+    return clampInt(100 - d.spot + net, 12, 92);
+  }
+  return clampInt(100 - Math.max(1, d.spot), 8, 95);
 }
 
 function rating(cmp: number, att: number, yds: number, td: number, int: number) {
@@ -218,41 +363,53 @@ function boxTeam(
   const players = off.players.map((p) => emptyLine(p.name, p.pos));
   const byName = new Map(players.map((p) => [p.name, p]));
 
-  let passYd = 0;
+  let netPass = 0;
+  let gross = 0;
   let rushYd = 0;
   let plays = 0;
-  let tds = 0;
   let ints = 0;
   let fumbles = 0;
+  let sackN = 0;
+  let passPlays = 0;
+  let rushPlays = 0;
+  let firsts = 0;
   const recTd = new Map<string, number>();
   const rushTd = new Map<string, number>();
 
+  let thirdAtt = 0;
+  let thirdMade = 0;
   for (const d of drives) {
-    passYd += d.passYd;
+    netPass += d.passYd;
+    gross += d.grossPass;
     rushYd += d.rushYd;
     plays += d.plays;
+    sackN += d.sacks;
+    passPlays += d.passPlays;
+    rushPlays += d.rushPlays;
+    firsts += d.firstDowns;
+    thirdAtt += d.thirdAtt;
+    thirdMade += d.thirdMade;
     if (d.scoreKind === "pass" && d.scorer) {
-      tds += 1;
       recTd.set(d.scorer, (recTd.get(d.scorer) ?? 0) + 1);
       const q = byName.get(qb.name);
       if (q) q.passTd += 1;
     }
     if (d.scoreKind === "rush" && d.scorer) {
-      tds += 1;
       rushTd.set(d.scorer, (rushTd.get(d.scorer) ?? 0) + 1);
     }
     if (d.turnover === "int") ints += 1;
     if (d.turnover === "fumble") fumbles += 1;
   }
+  netPass = Math.max(0, Math.round(netPass));
+  gross = Math.max(netPass, Math.round(gross));
+  rushYd = Math.max(0, Math.round(rushYd));
 
-  const ypa = clamp(qb.ypa * (off.passOff / def.passDef) * (0.9 + rng() * 0.2), 5.3, 10.4);
-  let att = clampInt(passYd / Math.max(4.5, ypa), 14, 52);
-  att = Math.max(att, (byName.get(qb.name)?.passTd ?? 0) + ints);
-  const sackP = clamp(0.072 * (def.passDef / off.passOff), 0.03, 0.13);
-  const sacks = binomial(rng, att, sackP);
-  const compP = clamp(qb.comp * (0.94 + 0.08 * (off.passOff / def.passDef)) * (0.96 + rng() * 0.08), 0.5, 0.82);
-  let cmp = binomial(rng, att, compP);
   const passTd = byName.get(qb.name)?.passTd ?? 0;
+  let att = Math.max(0, passPlays - sackN);
+  att = Math.max(att, passTd + ints);
+  const sacks = sackN;
+  const compP = clamp(qb.comp * (0.94 + 0.08 * (off.passOff / def.passDef)) * (0.96 + rng() * 0.08), 0.5, 0.78);
+  let cmp = binomial(rng, att, compP);
   if (cmp < passTd) cmp = passTd;
   if (cmp > att) cmp = att;
 
@@ -318,17 +475,16 @@ function boxTeam(
   const recYards = fitToTarget(
     scaleToSum(
       receivers.map((p, i) => rec[i] * yprOf(p.ypr)),
-      passYd,
+      gross,
     ),
-    passYd,
+    gross,
     receivers.map((p) => (recTd.get(p.name) ?? 0) * 4),
   );
 
   const rushers = off.players.filter((p) => p.rush > 0);
-  const ypcGuess = rushers.reduce((s, p) => s + p.ypc * p.rush, 0) / Math.max(1, rushers.reduce((s, p) => s + p.rush, 0));
-  let carriesTotal = clampInt(rushYd / Math.max(3.2, ypcGuess * (0.92 + rng() * 0.16)), 12, 42);
   const rushMins = rushers.map((p) => rushTd.get(p.name) ?? 0);
-  carriesTotal = Math.max(carriesTotal, rushMins.reduce((a, b) => a + b, 0));
+  let carriesTotal = Math.max(rushPlays, rushMins.reduce((a, b) => a + b, 0));
+  if (carriesTotal <= 0 && rushYd > 0) carriesTotal = clampInt(rushYd / 4.3, 8, 36);
   const cars = allocate(
     carriesTotal,
     rushers.map((p) => p.rush * (0.85 + rng() * 0.3)),
@@ -347,10 +503,10 @@ function boxTeam(
   const qLine = byName.get(qb.name)!;
   qLine.cmp = cmp;
   qLine.att = att;
-  qLine.passYd = passYd;
+  qLine.passYd = gross;
   qLine.int = ints;
   qLine.sack = sacks;
-  qLine.rating = rating(cmp, att, passYd, qLine.passTd, ints);
+  qLine.rating = rating(cmp, att, gross, qLine.passTd, ints);
 
   receivers.forEach((p, i) => {
     const line = byName.get(p.name)!;
@@ -373,9 +529,11 @@ function boxTeam(
   kLine.xpa = drives.filter((d) => d.result === "TD").length;
   kLine.xpm = drives.filter((d) => d.result === "TD" && d.points === 7).length;
 
-  const yards = passYd + rushYd;
-  const thirdAtt = clampInt(plays * 0.21 + normal(rng, 0, 0.6), 7, 16);
-  const thirdMade = binomial(rng, thirdAtt, clamp(0.3 + (edge - 1) * 0.28, 0.2, 0.58));
+  const yards = netPass + rushYd;
+  if (thirdAtt < 4) {
+    thirdAtt = clampInt(plays * 0.21 + normal(rng, 0, 0.6), 7, 16);
+    thirdMade = binomial(rng, thirdAtt, clamp(0.3 + (edge - 1) * 0.28, 0.2, 0.58));
+  }
   const penalties = clampInt(normal(rng, 5.5, 1.5), 1, 12);
   const penaltyYds = penalties * clampInt(normal(rng, 8.2, 1.4), 4, 15);
   const totalPlays = Math.max(1, plays + oppPlays);
@@ -395,10 +553,10 @@ function boxTeam(
     score: quarters.reduce((a, b) => a + b, 0),
     quarters,
     yards,
-    passYd,
+    passYd: netPass,
     rushYd,
     plays,
-    firstDowns: clampInt(yards / 15.5 + tds * 0.45 + normal(rng, 0, 1), 8, 34),
+    firstDowns: firsts,
     thirdMade,
     thirdAtt,
     turnovers: ints + fumbles,
@@ -433,42 +591,80 @@ function quartersFrom(drives: { points: number; quarter: number }[]) {
 
 export function simulateNflGame(away: NflTeam, home: NflTeam, rng: Rng, detail: boolean): NflGame {
   const wind = home.windMph ?? away.windMph ?? 0;
-  const nAway = clampInt(skewed(rng, 10.7, 1.15), 8, 15);
-  const nHome = clampInt(nAway + normal(rng, 0, 0.85), 8, 15);
   const builtA: Built[] = [];
   const builtH: Built[] = [];
-  const seq: { side: "A" | "H"; d: Built; quarter: number }[] = [];
-  const n = Math.max(nAway, nHome);
+  const stamped: { side: "A" | "H"; d: Built; quarter: number }[] = [];
   let aPts = 0;
   let hPts = 0;
-  for (let i = 0; i < n; i++) {
-    const quarter = Math.min(4, Math.floor((i / n) * 4) + 1);
-    if (i < nAway) {
-      const d = buildDrive(away, home, false, rng, { lead: aPts - hPts, quarter, wind });
-      builtA.push(d);
-      seq.push({ side: "A", d, quarter });
-      aPts += d.points;
+  let offense: "A" | "H" = rng() < 0.5 ? "A" : "H";
+  const secondHalfKick = offense === "A" ? "H" : "A";
+  let ytg = clampInt(skewed(rng, 70, 1.6), 66, 75);
+
+  const runHalf = (half: 1 | 2) => {
+    let clockLeft = 1800;
+    if (half === 2) {
+      offense = secondHalfKick;
+      ytg = clampInt(skewed(rng, 70, 1.6), 66, 75);
     }
-    if (i < nHome) {
-      const d = buildDrive(home, away, true, rng, { lead: hPts - aPts, quarter, wind });
-      builtH.push(d);
-      seq.push({ side: "H", d, quarter });
-      hPts += d.points;
+    let guard = 0;
+    while (clockLeft > 18 && guard++ < 30) {
+      const quarter = half === 1 ? (clockLeft > 900 ? 1 : 2) : clockLeft > 900 ? 3 : 4;
+      const off = offense === "A" ? away : home;
+      const def = offense === "A" ? home : away;
+      const lead = offense === "A" ? aPts - hPts : hPts - aPts;
+      const ending = quarter === 2 || quarter === 4;
+      const sec = callsOf(off).sec;
+      const hurry = ending && clockLeft < 155 && lead < 8;
+      const kneel = quarter === 4 && ((lead >= 14 && clockLeft < 220) || (lead >= 7 && clockLeft < 100) || (lead > 0 && clockLeft < 45));
+      const snap = hurry ? Math.max(12, sec * 0.46) : sec;
+      let d: Built;
+      if (kneel) {
+        d = kneelDrive(off, ytg);
+        clockLeft = 0;
+      } else {
+        const maxPlays = ending ? clampInt(Math.floor(clockLeft / snap), 1, 14) : 14;
+        d = buildDrive(off, def, offense === "H", rng, { lead, quarter, wind, start: ytg, maxPlays, hurry });
+        clockLeft -= d.plays * snap * (0.9 + rng() * 0.2);
+      }
+      if (offense === "A") {
+        builtA.push(d);
+        aPts += d.points;
+      } else {
+        builtH.push(d);
+        hPts += d.points;
+      }
+      stamped.push({ side: offense, d, quarter });
+      if (clockLeft <= 18) break;
+      ytg = nextSpot(d, rng);
+      offense = offense === "A" ? "H" : "A";
     }
-  }
-  const stamped = seq;
+  };
+  runHalf(1);
+  runHalf(2);
+
   const score = (side: "A" | "H") => stamped.filter((x) => x.side === side).reduce((s, x) => s + x.d.points, 0);
   let ot = false;
   let round = 0;
+  let otFirst: "A" | "H" = rng() < 0.5 ? "A" : "H";
   while (score("A") === score("H") && round < 3) {
     ot = true;
     round += 1;
-    const a = buildDrive(away, home, false, rng, { lead: 0, quarter: 5, wind });
-    const h = buildDrive(home, away, true, rng, { lead: 0, quarter: 5, wind });
-    builtA.push(a);
-    builtH.push(h);
-    stamped.push({ side: "A", d: a, quarter: 5 });
-    stamped.push({ side: "H", d: h, quarter: 5 });
+    const order: ("A" | "H")[] = otFirst === "A" ? ["A", "H"] : ["H", "A"];
+    for (const side of order) {
+      if (round === 1 && side !== order[0] && score("A") !== score("H") && stamped[stamped.length - 1]?.d.result === "TD") break;
+      const d = buildDrive(side === "A" ? away : home, side === "A" ? home : away, side === "H", rng, {
+        lead: 0,
+        quarter: 5,
+        wind,
+        start: 75,
+        maxPlays: 10,
+      });
+      if (side === "A") builtA.push(d);
+      else builtH.push(d);
+      stamped.push({ side, d, quarter: 5 });
+      if (d.result === "TD" && round > 1) break;
+    }
+    otFirst = otFirst === "A" ? "H" : "A";
   }
 
   const aQuarters = quartersFrom(stamped.filter((x) => x.side === "A").map((x) => ({ points: x.d.points, quarter: x.quarter })));
@@ -481,14 +677,15 @@ export function simulateNflGame(away: NflTeam, home: NflTeam, rng: Rng, detail: 
   const hPlays = builtH.reduce((s, d) => s + d.plays, 0);
   const awayBox = boxTeam(away, home, builtA, aQuarters, hPlays, false, rng);
   const homeBox = boxTeam(home, away, builtH, hQuarters, aPlays, true, rng);
-  // Sacks are recorded on the offense QB; show them as the opponent's defensive sacks.
   awayBox.sacks = homeBox.players.find((p) => p.pos === "QB")?.sack ?? 0;
   homeBox.sacks = awayBox.players.find((p) => p.pos === "QB")?.sack ?? 0;
 
-  // Recompute TOP now that both play counts are final (OT included).
-  const playsSum = Math.max(1, awayBox.plays + homeBox.plays);
-  awayBox.top = clock((awayBox.plays / playsSum) * (ot ? 3900 : 3600));
-  homeBox.top = clock((homeBox.plays / playsSum) * (ot ? 3900 : 3600));
+  const rawA = awayBox.plays * callsOf(away).sec;
+  const rawH = homeBox.plays * callsOf(home).sec;
+  const span = ot ? 3900 : 3600;
+  const scale = span / Math.max(1, rawA + rawH);
+  awayBox.top = clock(rawA * scale);
+  homeBox.top = clock(rawH * scale);
 
   const drives: Drive[] = detail
     ? stamped.map((x) => ({

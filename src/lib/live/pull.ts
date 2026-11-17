@@ -1,4 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
+import type { PropBoardData } from "@/lib/props";
 import type { League } from "@/lib/sim/types";
 import type { LiveLineup, LiveSlate } from "@/lib/live/types";
 
@@ -25,4 +26,15 @@ export const listLiveSlate = createServerFn({ method: "POST" })
   .handler(async ({ data }): Promise<LiveSlate> => {
     const { listSlate } = await import("./pull.server");
     return listSlate(data.league);
+  });
+
+export const listPlayerProps = createServerFn({ method: "POST" })
+  .validator((input: { league: League; awayId: string; homeId: string }) => {
+    if (input?.league !== "NFL" && input?.league !== "NBA") throw new Error("Pick a league");
+    if (!input.awayId || !input.homeId || input.awayId === input.homeId) throw new Error("Pick two different teams");
+    return input;
+  })
+  .handler(async ({ data }): Promise<PropBoardData> => {
+    const { listedProps } = await import("./pull.server");
+    return listedProps(data);
   });

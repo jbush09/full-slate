@@ -25,6 +25,7 @@ export type LiveLineup = {
   homeId: string;
   pulledAt: number;
   source: string;
+  factors: string | null;
   warning: string | null;
   slate: { label: string; whenLabel: string; state: string; flipped: boolean } | null;
   awaySpots: LiveSpot[];
